@@ -1,0 +1,4 @@
+chmod +x /tmp/script.sh
+systemctl status zabbix-agent2
+COPY /local/script.sh /tmp/script.sh
+ls -la /usr/sbin
