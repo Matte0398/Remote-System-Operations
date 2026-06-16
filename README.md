@@ -2,9 +2,13 @@
 
 Collection of scripts for executing remote operations on Linux and Windows systems.
 
-This repository contains utilities designed to support system administration, file deployment, remote command execution and infrastructure maintenance tasks.
+## Purpose
 
-## Included Tools
+This repository provides utilities designed to simplify remote administration and operational tasks across Linux and Windows environments.
+
+The included tools focus on automation, file deployment, command execution and infrastructure maintenance.
+
+---
 
 ### Linux Remote Operations
 
@@ -28,18 +32,49 @@ Python script based on Fabric for managing remote Linux systems over SSH.
 
 #### Install requirements
 
-```
+``` python
 pip install fabric
+```
+
+## Configuration Files
+
+### Linux target systems file
+
+File used by `Lnx_remote_oper.py` to identify the remote Linux systems.
+
+Example: `examples/remoteSystems.in`
+
+``` text
+server01,192.168.1.10
+server02,192.168.1.11
+```
+
+### Linux command file
+
+File used to define the commands executed on remote Linux systems.
+
+Example: `examples/commands.txt`
+
+``` test
+# Check service status
+systemctl status apache2
+
+# Copy a local script to the remote system
+COPY /local/script.sh /tmp/script.sh
+
+# Execute the copied script
+chmod +x /tmp/script.sh
+/tmp/script.sh
 ```
 
 #### Example
 
-```
+``` python
 python Lnx_remote_oper.py --exec commands.txt --user root
 python Lnx_remote_oper.py --diff -L /etc/hosts -R /etc/hosts --user root
 ```
 
-<hr>
+---
 
 ### Windows Remote Operations
 
@@ -68,15 +103,29 @@ PowerShell script used to copy or update files and directories from a local Wind
 - Network access to remote Windows systems
 - Permissions to copy or update files on target systems
 
+## Configuration Files
+
+### Windows objects file
+
+File used by WS_remote_oper.ps1 to define files or directories to copy/update.
+
+Example: `examples/objects_to_update.txt`
+
+``` text
+file:C:\temp\prova
+file:\local\config.ini;C$\App\config.ini
+C:\local\folder;C$\Temp\folder
+```
+
 #### Example
 
-```
+``` powershell
 .\WS_remote_oper.ps1
 ```
 
 ## Repository Structure
 
-```text
+``` text
 Remote-System-Operations/
 ├── Linux/
 │   └── Lnx_remote_oper.py
