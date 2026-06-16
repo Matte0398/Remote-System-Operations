@@ -1,0 +1,3 @@
+file:C:\temp\test.txt
+file:C:\temp\*txt:test.txt,prova.txt
+dir:C:\temp\*:old,backup
