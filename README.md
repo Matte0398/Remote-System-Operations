@@ -39,6 +39,8 @@ python Lnx_remote_oper.py --exec commands.txt --user root
 python Lnx_remote_oper.py --diff -L /etc/hosts -R /etc/hosts --user root
 ```
 
+<hr>
+
 ### Windows Remote Operations
 
 PowerShell script used to copy or update files and directories from a local Windows machine to multiple remote Windows systems.
