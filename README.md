@@ -17,7 +17,7 @@ Python script based on Fabric for managing remote Linux systems over SSH.
 - Compare local and remote files
 - Compare local and remote directories
 - Copy files or directories to remote systems
-- Skip potentially dangerous commands
+- Skip potentially dangerous commands (such as shutdown, reboot, mkfs, dd and recursive destructive commands)
 - Generate operation logs
 
 #### Requirements
