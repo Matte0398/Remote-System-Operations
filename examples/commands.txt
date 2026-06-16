@@ -1,4 +1,9 @@
-chmod +x /tmp/script.sh
-systemctl status zabbix-agent2
+# Check service status
+systemctl status apache2
+
+# Copy a local script to the remote system
 COPY /local/script.sh /tmp/script.sh
-ls -la /usr/sbin
+
+# Execute the copied script
+chmod +x /tmp/script.sh
+/tmp/script.sh
