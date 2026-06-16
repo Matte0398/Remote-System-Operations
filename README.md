@@ -10,7 +10,7 @@ This repository contains utilities designed to support system administration, fi
 
 Python script based on Fabric for managing remote Linux systems over SSH.
 
-Main features:
+#### Main features
 
 - Execute commands on multiple remote Linux systems
 - Run operations in parallel
@@ -20,11 +20,32 @@ Main features:
 - Skip potentially dangerous commands
 - Generate operation logs
 
+#### Requirements
+
+```
+Python 3
+Fabric
+SSH access to remote Linux systems
+```
+
+#### Install requirements
+
+```
+pip install fabric
+```
+
+#### Example
+
+```
+python Lnx_remote_oper.py --exec commands.txt --user root
+python Lnx_remote_oper.py --diff -L /etc/hosts -R /etc/hosts --user root
+```
+
 ### Windows Remote Operations
 
 PowerShell script used to copy or update files and directories from a local Windows machine to multiple remote Windows systems.
 
-Main features:
+#### Main features
 
 - Copy specific files
 - Copy files using wildcard patterns
@@ -33,13 +54,35 @@ Main features:
 - Read target systems from an input file
 - Generate operation logs
 
+#### Use Cases
+
+- Remote administration
+- File deployment
+- Configuration comparison
+- Infrastructure operations
+- Pre-monitoring and post-monitoring checks
+
+#### Requirements
+
+```
+Windows PowerShell
+Network access to remote Windows systems
+Permissions to copy or update files on target systems
+```
+
+#### Example
+
+```
+.\WS_remote_oper.ps1
+```
+
 ## Repository Structure
 
 ```text
 Remote-System-Operations/
-├── linux/
+├── Linux/
 │   └── Lnx_remote_oper.py
-├── windows/
+├── Windows/
 │   └── WS_remote_oper.ps1
 ├── examples/
 │   ├── remoteSystems.in
