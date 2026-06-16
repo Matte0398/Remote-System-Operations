@@ -112,9 +112,9 @@ File used by WS_remote_oper.ps1 to define files or directories to copy/update.
 Example: `examples/objects_to_update.txt`
 
 ``` text
-file:C:\temp\prova
-file:\local\config.ini;C$\App\config.ini
-C:\local\folder;C$\Temp\folder
+file:C:\temp\test.txt
+file:C:\temp\*txt:test.txt,prova.txt
+dir:C:\temp\*:old,backup
 ```
 
 #### Example
