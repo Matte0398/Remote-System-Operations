@@ -1,4 +1,4 @@
-# Remote System Operations
+# Remote-System-Operations
 
 Collection of scripts for executing remote operations on Linux and Windows systems.
 
@@ -17,16 +17,14 @@ Python script based on Fabric for managing remote Linux systems over SSH.
 - Compare local and remote files
 - Compare local and remote directories
 - Copy files or directories to remote systems
-- Skip potentially dangerous commands (such as shutdown, reboot, mkfs, dd and recursive destructive commands)
+- Skip potentially dangerous commands (such as `shutdown, reboot, mkfs, dd and recursive destructive commands`)
 - Generate operation logs
 
 #### Requirements
 
-```
-Python 3
-Fabric
-SSH access to remote Linux systems
-```
+- Python 3
+- Fabric
+- SSH access to remote Linux systems
 
 #### Install requirements
 
@@ -64,11 +62,9 @@ PowerShell script used to copy or update files and directories from a local Wind
 
 #### Requirements
 
-```
-Windows PowerShell
-Network access to remote Windows systems
-Permissions to copy or update files on target systems
-```
+- Windows PowerShell
+- Network access to remote Windows systems
+- Permissions to copy or update files on target systems
 
 #### Example
 
