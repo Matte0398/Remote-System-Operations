@@ -141,5 +141,6 @@ Remote-System-Operations/
 ├── examples/
 │   ├── remoteSystems.in
 │   ├── commands.txt
-│   └── objects_to_update.txt
+│   ├── object.txt
+│   └── system.txt
 └── README.md
