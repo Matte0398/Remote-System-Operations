@@ -69,14 +69,16 @@ chmod +x /tmp/script.sh
 
 #### Example
 
-``` python
 Execute the commands listed in commands.txt on the remote Linux systems using the root user:
 
-  python Lnx_remote_oper.py --exec commands.txt --user root
+``` python
+python Lnx_remote_oper.py --exec commands.txt --user root
+```
 
 Compare the local /etc/hosts file with the remote /etc/hosts file on the target Linux systems using the root user:
 
-  python Lnx_remote_oper.py --diff -L /etc/hosts -R /etc/hosts --user root
+``` python
+python Lnx_remote_oper.py --diff -L /etc/hosts -R /etc/hosts --user root
 ```
 
 ---
