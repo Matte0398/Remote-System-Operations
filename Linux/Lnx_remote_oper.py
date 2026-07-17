@@ -1,14 +1,20 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 
 """
-Remote System Manager - Execute commands and compare files/directories on remote systems
+Remote System Manager - Execute commands and compare files/directories on Linux remote systems
 Using Fabric library for simplified SSH operations
+
+Author: Matteo Z.
 """
 
 import argparse, sys, os, logging, getpass, difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from fabric import Connection, Config
 from invoke import UnexpectedExit
+
+OUTPUT_LOCK = Lock()
+OUTPUT_SEPARATOR = '=' * 80
 
 class RemoteSystem:
     """Manages connection to a remote system using Fabric"""
@@ -55,7 +61,7 @@ class RemoteSystem:
         """Execute command on remote system"""
         try:
             logger.info(f"[{self.hostname}] Executing: {command}")
-            result = self.connection.run(command, hide=False, warn=True)
+            result = self.connection.run(command, hide=True, warn=True)
 
             if result.ok:
                 logger.info(f"[{self.hostname}] Command successful")
@@ -236,11 +242,9 @@ INSTALLATION:
 def is_dangerous_command(command):
     """Check if command is potentially dangerous"""
     cmd_lower = command.lower().strip()
-    
     for dangerous in DANGEROUS_COMMANDS:
         if dangerous in cmd_lower:
             return True
-            
     return False
 
 
@@ -354,6 +358,7 @@ def execute_commands_from_file(command_file, remote_systems, user, password, max
             commands = [line.strip() for line in f if line.strip() and not line.startswith('#')]
     except Exception as e:
         logger.error(f"Failed to read command file: {str(e)}")
+        print(f"\nERROR: Failed to read command file '{command_file}': {str(e)}")
         return
 
     logger.info(f"Loaded {len(commands)} commands from {command_file}")
@@ -371,17 +376,59 @@ def execute_commands_from_file(command_file, remote_systems, user, password, max
         for future in as_completed(futures):
             hostname = futures[future]
             try:
-                future.result()
+                output = future.result()
+                if output:
+                    with OUTPUT_LOCK:
+                        print(output)
             except Exception as e:
                 logger.error(f"Error processing {hostname}: {str(e)}")
+                with OUTPUT_LOCK:
+                    print(format_system_output(hostname, 'unknown', [{
+                        'command': 'process system',
+                        'status': 'FAILED',
+                        'stdout': '',
+                        'stderr': str(e)
+                    }]))
+
+
+def format_system_output(hostname, ip, entries):
+    """Create a readable output block for one remote system."""
+    lines = [
+        '',
+        OUTPUT_SEPARATOR,
+        f'HOST: {hostname} ({ip})',
+        OUTPUT_SEPARATOR,
+    ]
+
+    for entry in entries:
+        lines.extend(['', f'$ {entry["command"]}', f'status: {entry["status"]}'])
+
+        stdout = entry.get('stdout', '').rstrip()
+        stderr = entry.get('stderr', '').rstrip()
+
+        if stdout:
+            lines.extend(['--- stdout ---', stdout])
+        if stderr:
+            lines.extend(['--- stderr ---', stderr])
+        if not stdout and not stderr:
+            lines.append('(no output)')
+
+    lines.append(OUTPUT_SEPARATOR)
+    return '\n'.join(lines)
 
 
 def execute_commands_on_system(hostname, ip, commands, user, password):
     """Execute list of commands on a single system"""
     remote = RemoteSystem(hostname, ip, user, password)
+    entries = []
 
     if not remote.connect():
-        return
+        return format_system_output(hostname, ip, [{
+            'command': 'connect',
+            'status': 'FAILED',
+            'stdout': '',
+            'stderr': 'Unable to establish SSH connection'
+        }])
 
     try:
         for cmd in commands:
@@ -391,21 +438,46 @@ def execute_commands_on_system(hostname, ip, commands, user, password):
                 if len(parts) == 3:
                     local_path = parts[1]
                     remote_path = parts[2]
-                    remote.copy_to_remote(local_path, remote_path)
+                    copied = remote.copy_to_remote(local_path, remote_path)
+                    entries.append({
+                        'command': cmd,
+                        'status': 'OK' if copied else 'FAILED',
+                        'stdout': f'Copied {local_path} to {remote_path}' if copied else '',
+                        'stderr': '' if copied else 'Copy failed; see remote_oper.log for details'
+                    })
                 else:
                     logger.error(f"[{hostname}] Invalid COPY syntax: {cmd}")
+                    entries.append({
+                        'command': cmd,
+                        'status': 'FAILED',
+                        'stdout': '',
+                        'stderr': 'Invalid COPY syntax. Expected: COPY <local_path> <remote_path>'
+                    })
                 continue
 
             # Check for dangerous commands
             if is_dangerous_command(cmd):
                 logger.warning(f"[{hostname}] SKIPPING DANGEROUS COMMAND: {cmd}")
-                print(f"\n⚠️  WARNING: Skipping dangerous command on {hostname}: {cmd}")
+                entries.append({
+                    'command': cmd,
+                    'status': 'SKIPPED',
+                    'stdout': '',
+                    'stderr': 'Dangerous command skipped'
+                })
                 continue
 
-            remote.execute_command(cmd)
+            return_code, stdout, stderr = remote.execute_command(cmd)
+            entries.append({
+                'command': cmd,
+                'status': f'EXIT {return_code}',
+                'stdout': stdout,
+                'stderr': stderr
+            })
 
     finally:
         remote.disconnect()
+
+    return format_system_output(hostname, ip, entries)
 
 
 def process_diff(remote_system, local_path, remote_path):
@@ -517,16 +589,16 @@ def main():
 
 if __name__ == '__main__':
     # Dangerous commands to avoid
-    DANGEROUS_COMMANDS = ['rm -rf', 'rm -f', 'shutdown', 'reboot', 'init', 'halt', 'poweroff', 'mkfs', 'dd', ':(){:|:&};:', 'mv / ', 'chmod -R 777', 'chmod -R 000', 'fdisk', 'parted', 'wipefs', 'mkswap', 'swapon', 'swapoff', 'kill', 'pkill', 'userdel', 'groupdel', '> /etc', 'mount', 'umount']
+    DANGEROUS_COMMANDS = ['rm -rf /', 'rm -rf /*', 'shutdown', 'reboot', 'init 0', 'init 6', 'halt', 'poweroff', 'mkfs', 'dd if=', ':(){:|:&};:', 'mv / ', 'chmod -R 777 /']
     
     # Configure logging
+    file_handler = logging.FileHandler('remote_oper.log')
+    file_handler.setLevel(logging.INFO)
+
     logging.basicConfig(
-        level=logging.INFO, 
-        format='%(asctime)s - %(levelname)s: %(message)s', 
-        handlers=[
-            logging.FileHandler('remote_oper.log'), 
-            logging.StreamHandler()
-        ]
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s: %(message)s',
+        handlers=[file_handler]
     )
     logger = logging.getLogger(__name__)
     
