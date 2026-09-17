@@ -1,222 +1,232 @@
-# Remote-System-Operations
+# Remote System Operations
 
-Collection of scripts for executing remote operations on Linux and Windows systems.
+Utilities for performing operations across multiple remote Linux or Windows systems.
 
-## Purpose
+| Script | Target systems | Operations | Connection |
+| --- | --- | --- | --- |
+| [Lnx_remote_oper.py](Lnx_remote_oper.py) | Linux | Execute commands, upload files and directories, compare local and remote paths | SSH and SFTP through Fabric |
+| [WS_remote_oper.ps1](WS_remote_oper.ps1) | Windows | Copy files and directories to the same path on remote systems | SMB through the `C$` administrative share |
 
-This repository provides utilities designed to simplify remote administration and operational tasks across Linux and Windows environments.
+Run the examples from this directory. Create the input files described below before running either script; they are not included in the project.
 
-The included tools focus on automation, file deployment, command execution and infrastructure maintenance.
+## Linux operations
 
----
+### Requirements
 
-### Linux Remote Operations
+- Python 3 and the `fabric` package on the local computer.
+- SSH access to each remote Linux system, with SFTP available for uploads and comparisons.
+- A remote account with permission to execute the requested commands and access the selected paths.
 
-Python script based on Fabric for managing remote Linux systems over SSH.
+Install the Python dependency:
 
-#### Main features
-
-- Execute commands on multiple remote Linux systems
-- Run operations in parallel
-- Compare local and remote files
-- Compare local and remote directories
-- Copy files or directories to remote systems
-- Skip potentially dangerous commands (such as `shutdown, reboot, mkfs, dd and recursive destructive commands`)
-- Generate operation logs
-
-#### Requirements
-
-- Python 3
-- Fabric
-- SSH access to remote Linux systems
-
-#### Install requirements
-
-``` python
-pip install fabric
+```sh
+python -m pip install fabric
 ```
 
-## Configuration Files
+### System list
 
-### Linux target systems file
+Create a file named `remoteSystems.in`, with one system per line:
 
-File used by `Lnx_remote_oper.py` to identify the remote Linux systems.
-
-Example: `examples/remoteSystems.in`
-
-``` text
-server01,192.168.1.10
-server02,192.168.1.11
+```text
+# hostname,connection_address
+linux01,192.0.2.10
+linux02,192.0.2.11
 ```
 
-### Linux command file
+The first field labels the system in the output; the second is the address passed to Fabric. Both fields are required. Blank lines and lines beginning with `#` are ignored. Malformed rows are logged and skipped; a file with no valid systems is rejected.
 
-File used to define the commands executed on remote Linux systems.
+Use `--systems` to select this file. The default location is `/tmp/remoteSystems.in`.
 
-Example: `examples/commands.txt`
+### Execute commands
 
-``` test
-# Check service status
-systemctl status apache2
+Create a file, such as `commands.txt`:
 
-# Copy a local script to the remote system
-COPY /local/script.sh /tmp/script.sh
-
-# Execute the copied script
-chmod +x /tmp/script.sh
-/tmp/script.sh
+```text
+# One command per line
+hostname
+uptime
+df -h
 ```
 
-#### Example
+Run the commands on every listed system:
 
-Execute the commands listed in commands.txt on the remote Linux systems using the root user:
-
-``` python
-python Lnx_remote_oper.py --exec commands.txt --user root
+```sh
+python Lnx_remote_oper.py --exec commands.txt --systems remoteSystems.in --user admin
 ```
 
-Compare the local /etc/hosts file with the remote /etc/hosts file on the target Linux systems using the root user:
+The script prompts once for the SSH password and reuses the credentials across hosts. Hosts run concurrently, with five workers by default. Commands run in file order on each host, and subsequent commands are still attempted after a command fails or is skipped.
 
-``` python
-python Lnx_remote_oper.py --diff -L /etc/hosts -R /etc/hosts --user root
+Each line is a separate remote command: shell state such as `cd` does not persist between lines. Put dependent operations on the same line, for example `cd /opt/app && ls`.
+
+To use an SSH key or the SSH agent/configuration without the script's password prompt:
+
+```sh
+python Lnx_remote_oper.py --exec commands.txt --systems remoteSystems.in --user admin --key /home/operator/.ssh/id_ed25519
+python Lnx_remote_oper.py --exec commands.txt --systems remoteSystems.in --user admin --no-password
 ```
 
----
+`--key` and `--no-password` cannot be used together.
 
-### Windows Remote Operations
+### Upload files and directories
 
-## Description
+Use the `COPY` pseudo-command in a command file:
 
-PowerShell script to copy or update files and directories from a **local Windows client** to one or more **remote Windows servers** using **WinRM (Windows Remote Management)**, without relying on administrative shares (`C$`).
-
-The script reads a list of target machines and a list of objects to transfer, opens a PSSession to each remote host, and copies files or directories preserving the same absolute path on the destination.
-
-## Requirements
-
-### On the SERVER (remote machine) — run as Administrator
-
-Enable WinRM and PowerShell Remoting:
-
-```powershell
-# Enable WinRM with default settings
-Enable-PSRemoting -Force
-
-# Verify the WinRM service is running
-Get-Service WinRM
-
-# (Optional) Allow connections from all hosts — useful in Workgroup environments
-Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force
-
-# (Optional) Verify WinRM configuration
-winrm quickconfig
+```text
+COPY "./config/app.conf" "/tmp/app.conf"
+COPY "./config" "/tmp/app-config"
 ```
 
-> **Domain (Active Directory) environments:** `Enable-PSRemoting -Force` is sufficient. No need to modify `TrustedHosts`.
+`COPY <local_path> <remote_path>` uploads through SFTP. A directory upload copies its contents recursively into the specified remote directory, creating directories as needed. A single-file upload requires the remote parent directory to exist. Existing destination files may be overwritten; extra remote files are not deleted.
 
-> **Workgroup environments:** You must add the client to the server's `TrustedHosts` (see above) and vice versa.
+Local relative paths are resolved from the directory where you launch the script. The parser uses POSIX shell quoting; when running on Windows, use quoted paths with forward slashes, such as `"C:/temp/app.conf"`.
 
-Verify that the firewall allows WinRM traffic (port **5985** HTTP or **5986** HTTPS):
+### Compare paths
 
-```powershell
-# Check existing WinRM firewall rules (already added by Enable-PSRemoting)
-Get-NetFirewallRule -DisplayName "*Windows Remote Management*"
+Compare a local file with its remote counterpart:
+
+```sh
+python Lnx_remote_oper.py --diff --local ./config/app.conf --remote /etc/app/app.conf --systems remoteSystems.in --user admin
 ```
 
-### On the CLIENT (local machine) — run as Administrator
+Compare directories recursively:
 
-Make sure WinRM is active on the client side as well (required for `New-PSSession`):
-
-```powershell
-# Start the WinRM service and set it to start automatically
-Start-Service WinRM
-Set-Service WinRM -StartupType Automatic
-
-# Add remote servers to TrustedHosts (required outside of a domain)
-# Replace with your actual hostnames or IP addresses, or use "*" for all
-Set-Item WSMan:\localhost\Client\TrustedHosts -Value "server01,192.168.1.10,server02,192.168.1.11" -Force
-
-# Verify
-Get-Item WSMan:\localhost\Client\TrustedHosts
+```sh
+python Lnx_remote_oper.py --diff -L ./config -R /etc/app --systems remoteSystems.in --user admin --parallel 3
 ```
 
-## Configuration Files
+Comparison reports identical files, entries found on only one side, and file-type differences. UTF-8 text differences are shown as unified diffs. Files containing NUL bytes or invalid UTF-8 are reported as binary when their contents differ.
 
-Both configuration files must be placed in `C:\temp\`.
+Comparisons do not modify either path. They compare file contents and directory entries, not permissions, ownership, or timestamps. Remote directory scans do not follow symbolic links, and matching symlink entries are not compared by target. Files are read fully into memory.
 
-### `C:\temp\system.txt` — list of remote servers
+**Detected differences do not cause a failure exit code.** A comparison succeeds when it completes, even if the paths differ; inaccessible or unreadable paths cause failures.
 
-Format: `<hostname>,<ip_address>`
+### Command-line options
 
+| Option | Description | Default |
+| --- | --- | --- |
+| `--exec FILE` | Execute commands from a file; mutually exclusive with `--diff` | One mode is required |
+| `--diff` | Compare local and remote paths; requires `--local` and `--remote` | One mode is required |
+| `-L`, `--local` | Local path for comparison | None |
+| `-R`, `--remote` | Remote path for comparison | None |
+| `--user` | SSH username | Required |
+| `--systems` | System list path | `/tmp/remoteSystems.in` |
+| `--parallel` | Maximum concurrent host workers; positive integer | `5` |
+| `--key` | SSH private key path; suppresses the password prompt | None |
+| `--no-password` | Use SSH agent/configuration; suppresses the password prompt | Disabled |
+| `--connect-timeout` | Connection timeout in seconds; positive integer | `10` |
+| `--command-timeout` | Remote command timeout in seconds; positive integer | No explicit limit |
+| `--allow-dangerous` | Disable the built-in destructive-command guard | Disabled |
+| `-h`, `--help` | Show command-line help | |
+
+Command files are trusted input. The script has a best-effort guard for selected destructive commands, including shutdown/reboot commands and certain disk or root-directory operations. It is not a complete shell-command validator. A blocked command is reported as `SKIPPED` and makes the run unsuccessful unless the guard is explicitly disabled with `--allow-dangerous`.
+
+### Output and exit codes
+
+Console output is grouped by host and includes command status, standard output, and standard error. Host blocks appear in completion order. Connection and operation events are appended to `remote_oper.log` in the current working directory.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | All host operations completed successfully; comparisons may still report differences |
+| `1` | At least one host operation failed, a command returned a nonzero status, or a command was blocked |
+| `2` | Argument or input-file validation error reported by the argument parser |
+
+## Windows operations
+
+### Requirements
+
+- Windows with PowerShell and the `Test-NetConnection` cmdlet available.
+- Network access to TCP port `445` on each target.
+- The remote `C$` administrative share enabled and accessible with the supplied credentials.
+- Local source files and directories on drive `C:`.
+
+The Windows script copies content over SMB. It does not execute remote commands or require a WinRM session.
+
+### System list
+
+Create `C:\temp\system.txt`:
+
+```text
+# hostname,ip_address
+windows01,192.0.2.20
+windows02,192.0.2.21
 ```
-server01,192.168.1.10
-server02,192.168.1.11
-# this line is ignored
-server03,192.168.1.12
+
+The script first checks port `445` using the hostname. It tries the supplied IP address only if that check fails. An empty IP field is allowed (`windows01,`), but the hostname and comma are required. Blank lines and comment lines are ignored. Invalid rows count as failures, while valid hosts are still processed.
+
+### Object list
+
+Create `C:\temp\object.txt` containing the local paths to copy:
+
+```text
+# Copy one file
+file:C:\temp\app.conf
+
+# Copy matching files, excluding specific names
+file:C:\temp\*.txt:notes.txt,private.txt
+
+# Copy a directory recursively, excluding names at every level
+dir:C:\temp\app:logs,backup
+
+# Without a prefix, file mode is used
+C:\temp\settings.ini
 ```
 
-**Rules:**
-- One entry per line
-- Each entry must contain exactly two comma-separated fields: hostname and IP address
-- Lines starting with `#` are treated as comments and skipped
-- Blank lines are ignored
+The syntax is `file:<local_path_or_pattern>[:excluded_name,...]` or `dir:<local_path_or_pattern>[:excluded_name,...]`.
 
-### `C:\temp\object.txt` — list of objects to copy
+- Wildcards are supported only in the final path component, not intermediate directories.
+- Exclusions match exact file or directory names, case-insensitively; they are not wildcard patterns.
+- Directory exclusions apply recursively and prevent excluded directories from being traversed.
+- Blank lines and lines beginning with `#` are ignored.
+- Paths containing spaces can be written directly in the object list, without surrounding quotes.
 
-| Format | Description |
-|---|---|
-| `file:C:\temp\test.txt` | Copy a specific file |
-| `file:C:\temp\test*` | Copy all files whose name starts with `test` |
-| `file:C:\temp\*` | Copy all files in the specified directory |
-| `file:C:\temp\*.txt:skip.txt,old.txt` | Copy all `.txt` files, excluding `skip.txt` and `old.txt` |
-| `dir:C:\temp\mydir` | Copy an entire directory recursively |
-| `dir:C:\temp\test*` | Copy all directories whose name starts with `test` recursively |
-| `dir:C:\temp\*:old,backup` | Copy all directories, excluding those named `old` and `backup` |
-| `C:\temp\test.txt` | Equivalent to `file:C:\temp\test.txt` |
-| `#file:C:\temp\skip.txt` | Commented line — skipped |
+### Run the copy
 
-> **Important:** The destination path on the remote server is **identical to the local source path**.  
-> For example, `C:\temp\file.txt` on the client will be copied to `C:\temp\file.txt` on the server.  
-> Make sure the destination directories exist or that the remote user has permission to create them.
-
-## Running the Script
-
-Open PowerShell as **Administrator** on the client and run:
+Use the default configuration directory:
 
 ```powershell
 .\WS_remote_oper.ps1
 ```
 
-During execution, a **credential prompt will appear for each server** in `system.txt`. This is by design — different credentials can be used for each target machine.
+Or specify configuration and log paths:
 
-## Output and Logging
+```powershell
+.\WS_remote_oper.ps1 -PathOper 'C:\operations'
 
-| Output | Details |
-|---|---|
-| **Console** | Color-coded messages: green = success, yellow = warning, red = error, cyan = info |
-| **Log file** | `C:\temp\log-YYYY-MM-DD_HH-mm-ss.log` — created automatically on each run |
+.\WS_remote_oper.ps1 -SystemList 'C:\operations\hosts.txt' -ObjectList 'C:\operations\objects.txt' -LogPath 'C:\operations\copy.log'
+```
+
+The script requests credentials once with `Get-Credential`, then processes hosts sequentially. Each remote share is mapped to a temporary PSDrive, which the script attempts to remove after processing that host.
+
+| Parameter | Description | Default |
+| --- | --- | --- |
+| `-PathOper` | Working directory and base for default input/log paths | `C:\temp` |
+| `-SystemList` | System list file | `system.txt` under `-PathOper` |
+| `-ObjectList` | Object specification file | `object.txt` under `-PathOper` |
+| `-LogPath` | Log file | `log-yyyy-MM-dd_HH-mm-ss.log` under `-PathOper` |
+
+### Copy behavior and results
+
+The destination preserves the source's absolute path on every target. For example:
+
+```text
+C:\temp\app.conf -> \\windows01\C$\temp\app.conf
+```
+
+There is no separate destination-path option. Sources outside drive `C:` and unsupported source path formats are skipped. Missing destination directories are created, existing files are overwritten with `Copy-Item -Force`, and extra destination files are retained. This is a copy operation, not a content comparison or mirror synchronization.
+
+During recursive traversal, child directories marked as reparse points, such as junctions and directory symlinks, are skipped. Per-directory, per-host, and overall summaries report copied files, skipped items, and failures. A source pattern matching no items counts as a failure; intentionally skipped items alone do not.
+
+Status messages and copy details are written to the selected log. The script exits with `0` when no failures occurred and logging remained healthy, or `1` on failure, including credential cancellation and logging errors.
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---|---|
-| `WinRM is not reachable` | Run `Enable-PSRemoting -Force` on the server and confirm port 5985 is open in the firewall |
-| `Access Denied` | Verify credentials and confirm the user belongs to the `Remote Management Users` or `Administrators` group on the server |
-| `TrustedHosts` error | Add the server to `TrustedHosts` on the client (see CLIENT section above) |
-| Credential prompt appears N times | Expected behavior — one prompt per server in `system.txt` |
-| Slow file transfer | Normal for large files over WinRM; consider splitting transfers into smaller batches |
-| Source path not found | Verify that the paths in `object.txt` exist on the local machine before running |
-
-## Repository Structure
-
-``` text
-Remote-System-Operations/
-├── Linux/
-│   └── Lnx_remote_oper.py
-├── Windows/
-│   └── WS_remote_oper.ps1
-├── examples/
-│   ├── remoteSystems.in
-│   ├── commands.txt
-│   ├── object.txt
-│   └── system.txt
-└── README.md
+| Problem | What to check |
+| --- | --- |
+| Python cannot import `fabric` | Install Fabric into the same Python environment used to run the script |
+| Linux SSH connection fails | Check the connection address, SSH access, username, authentication, and `remote_oper.log` |
+| Linux upload or comparison fails | Check local and remote paths, permissions, and SFTP availability; create the parent directory for single-file uploads |
+| A Linux command is skipped | Inspect the command and the destructive-command guard message |
+| Windows port `445` is unreachable | Check name resolution, routing, firewall rules, and SMB availability |
+| Windows share mapping fails | Check access to `\\host\C$` and the supplied credentials |
+| Windows source is skipped or missing | Check that it is on `C:`, matches the selected `file`/`dir` mode, and is not excluded |
+| Log writing fails | Check that the log directory is writable and the file is accessible |
