@@ -1,605 +1,474 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+"""Execute commands and compare paths on remote Linux systems using Fabric."""
 
-"""
-Remote System Manager - Execute commands and compare files/directories on Linux remote systems
-Using Fabric library for simplified SSH operations
-
-Author: Matteo Z.
-"""
-
-import argparse, sys, os, logging, getpass, difflib
+import argparse
+import difflib
+import getpass
+import logging
+import os
+import posixpath
+import shlex
+import stat
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from threading import Lock
-from fabric import Connection, Config
-from invoke import UnexpectedExit
 
+from fabric import Config, Connection
+
+# Serializes console writes so output produced by parallel workers cannot
+# become interleaved.
 OUTPUT_LOCK = Lock()
-OUTPUT_SEPARATOR = '=' * 80
+
+# Reusable separator for the per-host output blocks.
+SEP = "=" * 80
+
+# Module-level logger; __name__ identifies this module in every log record.
+logger = logging.getLogger(__name__)
+
+# Commands that can stop or restart a remote system and therefore require the
+# explicit --allow-dangerous option. SysV equivalents ("init 0" and "init 6")
+# are handled separately because "init" alone is not necessarily destructive.
+POWER_COMMANDS = {"shutdown", "reboot", "halt", "poweroff"}
+
+
+def configure_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s: %(message)s",
+        handlers=[logging.FileHandler("remote_oper.log", encoding="utf-8")],
+    )
+
 
 class RemoteSystem:
-    """Manages connection to a remote system using Fabric"""
-
-    def __init__(self, hostname, ip, user, password):
-        self.hostname = hostname
-        self.ip = ip
-        self.user = user
-        self.password = password
+    def __init__(self, hostname, ip, user, password=None, key=None,
+                 connect_timeout=10, command_timeout=None):
+        self.hostname, self.ip, self.user = hostname, ip, user
+        self.password, self.key = password, key
+        self.connect_timeout, self.command_timeout = connect_timeout, command_timeout
         self.connection = None
 
     def connect(self):
-        """Establish SSH connection"""
         try:
-            logger.info(f"Connecting to {self.hostname} ({self.ip}) as user '{self.user}'...")
-
-            connect_kwargs = {'password': self.password}
-            config = Config(overrides={'run': {'warn': True}})
-
-            self.connection = Connection(
-                host=self.ip,
-                user=self.user,
-                connect_kwargs=connect_kwargs,
-                config=config
-            )
-
-            # Test connection
-            self.connection.run('echo "Connection test"', hide=True)
-
-            logger.info(f"Successfully connected to {self.hostname}")
+            logger.info("Connecting to %s (%s) as '%s'", self.hostname, self.ip, self.user)
+            kwargs = {"timeout": self.connect_timeout}
+            if self.password is not None:
+                kwargs["password"] = self.password
+            if self.key:
+                kwargs["key_filename"] = self.key
+            # "warn" prevents Fabric from raising an exception for every non-zero
+            # exit code, allowing us to collect it and include it in the summary.
+            config = Config(overrides={"run": {"warn": True, "timeout": self.command_timeout}})
+            self.connection = Connection(self.ip, user=self.user,
+                                         connect_kwargs=kwargs, config=config)
+            self.connection.open()
+            result = self.connection.run("true", hide=True, warn=True)
+            if not result.ok:
+                raise RuntimeError(f"connection test exited {result.return_code}")
             return True
-
-        except Exception as e:
-            logger.error(f"Failed to connect to {self.hostname}: {str(e)}")
+        except Exception as exc:
+            logger.error("Connection to %s failed: %s", self.hostname, exc)
+            self.disconnect()
             return False
 
     def disconnect(self):
-        """Close SSH connection"""
         if self.connection:
-            self.connection.close()
-            logger.info(f"Disconnected from {self.hostname}")
+            try:
+                self.connection.close()
+            finally:
+                self.connection = None
 
-    def execute_command(self, command):
-        """Execute command on remote system"""
+    def sftp(self):
+        if not self.connection:
+            raise RuntimeError("SSH connection is not open")
+        return self.connection.sftp()
+
+    def execute(self, command):
         try:
-            logger.info(f"[{self.hostname}] Executing: {command}")
-            result = self.connection.run(command, hide=True, warn=True)
-
-            if result.ok:
-                logger.info(f"[{self.hostname}] Command successful")
-            else:
-                logger.warning(f"[{self.hostname}] Command failed with exit code {result.return_code}")
-
+            logger.info("[%s] Executing: %s", self.hostname, command)
+            result = self.connection.run(command, hide=True, warn=True,
+                                         timeout=self.command_timeout)
             return result.return_code, result.stdout, result.stderr
+        except Exception as exc:
+            logger.error("[%s] Command error: %s", self.hostname, exc)
+            return -1, "", str(exc)
 
-        except UnexpectedExit as e:
-            logger.error(f"[{self.hostname}] Command failed: {str(e)}")
-            return e.result.return_code, e.result.stdout, e.result.stderr
-        except Exception as e:
-            logger.error(f"[{self.hostname}] Error executing command: {str(e)}")
-            return -1, "", str(e)
-
-    def remote_exists(self, path):
-        """Check if remote path exists"""
+    def kind(self, path):
         try:
-            result = self.connection.run(f'test -e "{path}"', hide=True, warn=True)
-            return result.ok
-        except:
-            return False
+            # lstat does not follow symbolic links, so they can be distinguished
+            # from the files or directories they point to.
+            mode = self.sftp().lstat(path).st_mode
+        except OSError:
+            return None
+        if stat.S_ISDIR(mode):
+            return "directory"
+        if stat.S_ISLNK(mode):
+            return "symlink"
+        return "file"
 
-    def is_remote_dir(self, path):
-        """Check if remote path is a directory"""
+    def read_bytes(self, path):
         try:
-            result = self.connection.run(f'test -d "{path}"', hide=True, warn=True)
-            return result.ok
-        except:
-            return False
-
-    def read_remote_file(self, remote_path):
-        """Read remote file content"""
-        try:
-            result = self.connection.run(f'cat "{remote_path}"', hide=True, warn=True)
-            if result.ok:
-                return result.stdout
-            else:
-                logger.error(f"[{self.hostname}] Cannot read {remote_path}")
-                return None
-        except Exception as e:
-            logger.error(f"[{self.hostname}] Cannot read {remote_path}: {str(e)}")
+            with self.sftp().open(path, "rb") as handle:
+                return handle.read()
+        except Exception as exc:
+            logger.error("[%s] Cannot read %s: %s", self.hostname, path, exc)
             return None
 
-    def list_remote_dir(self, remote_path):
-        """List remote directory contents"""
+    def manifest(self, root):
+        result = {}
+        # The manifest always uses relative POSIX paths. This makes it directly
+        # comparable with the local manifest even when this script runs on Windows.
+        def visit(current, relative=""):
+            for item in self.sftp().listdir_attr(current):
+                rel = posixpath.join(relative, item.filename)
+                full = posixpath.join(current, item.filename)
+                kind = ("directory" if stat.S_ISDIR(item.st_mode) else
+                        "symlink" if stat.S_ISLNK(item.st_mode) else "file")
+                result[rel] = kind
+                # Do not follow symlinks: they could create cycles or make the
+                # scan leave the requested directory tree.
+                if kind == "directory":
+                    visit(full, rel)
+        visit(root)
+        return result
+
+    def mkdirs(self, path):
+        path = posixpath.normpath(path)
+        if path in ("", "."):
+            return
+        current = "/" if path.startswith("/") else ""
+        # SFTP has no recursive equivalent of "mkdir -p", so build the path one
+        # component at a time without invoking a remote shell.
+        for part in path.split("/"):
+            if not part:
+                continue
+            current = posixpath.join(current, part)
+            try:
+                self.sftp().stat(current)
+            except OSError:
+                self.sftp().mkdir(current)
+
+    def copy(self, local, remote):
         try:
-            result = self.connection.run(f'ls -1 "{remote_path}"', hide=True, warn=True)
-            if result.ok:
-                return [item for item in result.stdout.strip().split('\n') if item]
-            else:
-                logger.error(f"[{self.hostname}] Cannot list directory {remote_path}")
-                return []
-        except Exception as e:
-            logger.error(f"[{self.hostname}] Cannot list directory {remote_path}: {str(e)}")
-            return []
-
-    def copy_to_remote(self, local_path, remote_path):
-        """Copy local file/directory to remote system"""
-        try:
-            if os.path.isfile(local_path):
-                logger.info(f"[{self.hostname}] Copying {local_path} to {remote_path}")
-                self.connection.put(local_path, remote=remote_path)
-                logger.info(f"[{self.hostname}] File copied successfully")
+            if os.path.isfile(local):
+                self.sftp().put(local, remote)
                 return True
-
-            elif os.path.isdir(local_path):
-                logger.info(f"[{self.hostname}] Copying directory {local_path} to {remote_path}")
-                # Create remote directory
-                self.connection.run(f'mkdir -p "{remote_path}"', hide=True, warn=True)
-
-                # Copy all files recursively
-                for root, dirs, files in os.walk(local_path):
-                    # Calculate relative path
-                    rel_path = os.path.relpath(root, local_path)
-                    if rel_path == '.':
-                        remote_dir = remote_path
-                    else:
-                        remote_dir = os.path.join(remote_path, rel_path).replace('\\', '/')
-
-                    # Create directories
-                    for dir_name in dirs:
-                        remote_subdir = os.path.join(remote_dir, dir_name).replace('\\', '/')
-                        self.connection.run(f'mkdir -p "{remote_subdir}"', hide=True, warn=True)
-
-                    # Copy files
-                    for file_name in files:
-                        local_file = os.path.join(root, file_name)
-                        remote_file = os.path.join(remote_dir, file_name).replace('\\', '/')
-                        self.connection.put(local_file, remote=remote_file)
-
-                logger.info(f"[{self.hostname}] Directory copied successfully")
-                return True
-            else:
-                logger.error(f"[{self.hostname}] Local path does not exist: {local_path}")
+            if not os.path.isdir(local):
+                logger.error("[%s] Local path not found: %s", self.hostname, local)
                 return False
-
-        except Exception as e:
-            logger.error(f"[{self.hostname}] Error copying to remote: {str(e)}")
+            self.mkdirs(remote)
+            for root, dirs, files in os.walk(local):
+                # os.walk returns native separators, whereas the remote Linux
+                # server always requires '/'.
+                rel = os.path.relpath(root, local)
+                target = remote if rel == "." else posixpath.join(
+                    remote, rel.replace(os.sep, "/"))
+                self.mkdirs(target)
+                for name in dirs:
+                    self.mkdirs(posixpath.join(target, name))
+                for name in files:
+                    self.sftp().put(os.path.join(root, name), posixpath.join(target, name))
+            return True
+        except Exception as exc:
+            logger.error("[%s] Copy failed: %s", self.hostname, exc)
             return False
 
 
-def print_usage():
-    """Print usage information"""
-    usage = """
-Remote System Manager - Usage Guide (Fabric Version)
-=====================================================
-
-BASIC USAGE:
-    python remote_manager.py [OPTIONS]
-
-OPTIONS:
-    --diff                  Enable diff mode to compare local and remote files/directories
-    -L, --local <path>      Local file or directory path (used with --diff)
-    -R, --remote <path>     Remote file or directory path (used with --diff)
-    --user <username>       SSH username (required)
-    --exec <file>           Execute commands from specified file on remote systems
-    --systems <file>        Path to remote systems file (default: /tmp/remoteSystems.in)
-    --parallel <n>          Number of parallel connections (default: 5)
-    -h, --help             Show this help message
-
-REMOTE SYSTEMS FILE FORMAT:
-    File: /tmp/remoteSystems.in (or specified with --systems)
-    Format: hostname,ip_address
-
-    Example:
-        server1,192.168.1.10
-        server2,192.168.1.11
-        webserver,10.0.0.5
-
-EXAMPLES:
-
-1. Compare local and remote files:
-    python remote_manager.py --diff -L /etc/hosts -R /etc/hosts --user myuser
-
-2. Compare directories:
-    python remote_manager.py --diff -L /local/scripts -R /remote/scripts --user root
-
-3. Execute commands from file:
-    python remote_manager.py --exec commands.txt --user admin
-
-4. Execute with more parallel connections:
-    python remote_manager.py --exec commands.txt --user root --parallel 10
-
-COMMAND FILE FORMAT (for --exec):
-    - One command per line
-    - Lines starting with # are comments
-    - Special command: COPY <local_path> <remote_path>
-
-    Example commands.txt:
-        # System updates
-        systemctl status apache2
-        COPY /local/script.sh /tmp/script.sh
-        chmod +x /tmp/script.sh
-        /tmp/script.sh
-
-DANGEROUS COMMANDS:
-    The script will automatically skip dangerous commands like:
-    - rm -rf /
-    - shutdown, reboot, halt
-    - mkfs, dd
-    - chmod -R 777 /
-
-NOTES:
-    - Logs are saved to remote_oper.log
-    - Password will be prompted (not stored in command line)
-    - Use --parallel to control concurrent connections (default: 5)
-    - Binary files in diff mode will be skipped
-    - Fabric library provides simplified SSH operations
-
-INSTALLATION:
-    pip install fabric
-"""
-    print(usage)
-    sys.exit(0)
+def positive_int(value):
+    try:
+        value = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return value
 
 
 def is_dangerous_command(command):
-    """Check if command is potentially dangerous"""
-    cmd_lower = command.lower().strip()
-    for dangerous in DANGEROUS_COMMANDS:
-        if dangerous in cmd_lower:
+    """Best-effort guard only; command files must still be trusted."""
+    # Normalize the fork bomb so variants containing extra whitespace are caught.
+    if ":(){:|:&};:" in "".join(command.lower().split()):
+        return True
+    try:
+        tokens = [x.lower() for x in shlex.split(command, posix=True)]
+    except ValueError:
+        return True
+    # basename recognizes both a bare "rm" and paths such as "/bin/rm".
+    names = [posixpath.basename(x) for x in tokens]
+    if any(x in POWER_COMMANDS or x.startswith("mkfs") for x in names):
+        return True
+    if "dd" in names and any(x.startswith(("if=", "of=")) for x in tokens):
+        return True
+    for index, name in enumerate(names):
+        tail = tokens[index + 1:]
+        # Separate options from positional arguments to recognize equivalent
+        # forms such as "rm -rf /" and "rm -r -f -- /".
+        args = [x for x in tail if not x.startswith("-")]
+        opts = "".join(x.lstrip("-") for x in tail if x.startswith("-"))
+        if name == "init" and args and args[0] in {"0", "6"}:
+            return True
+        if name == "rm" and "r" in opts and "f" in opts and any(x in {"/", "/*"} for x in args):
+            return True
+        if name == "chmod" and "r" in opts and "/" in args and any(
+                x in {"777", "a+rwx", "ugo+rwx"} for x in args):
+            return True
+        if name == "mv" and args and args[0] == "/":
             return True
     return False
 
 
-def compare_files(local_path, remote_system, remote_path):
-    """Compare local and remote files/directories"""
-    logger.info(f"Comparing local '{local_path}' with remote '{remote_path}' on {remote_system.hostname}")
-
-    # Check local existence
-    local_exists = os.path.exists(local_path)
-    remote_exists = remote_system.remote_exists(remote_path)
-
-    if not local_exists and not remote_exists:
-        print(f"\n[{remote_system.hostname}] Both local and remote paths do not exist")
-        return
-
-    if not local_exists:
-        print(f"\n[{remote_system.hostname}] Local path '{local_path}' does not exist")
-        print(f"Remote path '{remote_path}' exists")
-        return
-
-    if not remote_exists:
-        print(f"\n[{remote_system.hostname}] Remote path '{remote_path}' does not exist")
-        print(f"Local path '{local_path}' exists")
-        return
-
-    # Check if paths are files or directories
-    local_is_dir = os.path.isdir(local_path)
-    remote_is_dir = remote_system.is_remote_dir(remote_path)
-
-    if local_is_dir != remote_is_dir:
-        print(f"\n[{remote_system.hostname}] Type mismatch:")
-        print(f"  Local: {'directory' if local_is_dir else 'file'}")
-        print(f"  Remote: {'directory' if remote_is_dir else 'file'}")
-        return
-
-    if local_is_dir:
-        compare_directories(local_path, remote_system, remote_path)
-    else:
-        compare_file_content(local_path, remote_system, remote_path)
+def local_manifest(root):
+    base, result = Path(root), {}
+    for path in base.rglob("*"):
+        # as_posix makes local Windows paths comparable with SFTP paths.
+        rel = path.relative_to(base).as_posix()
+        result[rel] = ("symlink" if path.is_symlink() else
+                       "directory" if path.is_dir() else "file")
+    return result
 
 
-def compare_file_content(local_file, remote_system, remote_file):
-    """Compare content of local and remote files"""
+def compare_file(local, remote_system, remote, label=None):
     try:
-        with open(local_file, 'r', encoding='utf-8', errors='ignore') as f:
-            local_content = f.readlines()
-    except Exception as e:
-        logger.error(f"Cannot read local file {local_file}: {str(e)}")
-        print(f"\n[{remote_system.hostname}] Cannot read local file: {str(e)}")
-        return
-
-    remote_content = remote_system.read_remote_file(remote_file)
-    if remote_content is None:
-        print(f"\n[{remote_system.hostname}] Cannot read remote file (might be binary or permission denied)")
-        return
-
-    remote_lines = remote_content.splitlines(keepends=True)
-
-    # Generate diff
-    diff = list(difflib.unified_diff(
-        local_content,
-        remote_lines,
-        fromfile=f'local: {local_file}',
-        tofile=f'remote: {remote_file}',
-        lineterm=''
-    ))
-
-    if diff:
-        print(f"\n[{remote_system.hostname}] Differences found:")
-        print('=' * 80)
-        for line in diff:
-            print(line)
-        print('=' * 80)
-    else:
-        print(f"\n[{remote_system.hostname}] Files are identical")
-
-
-def compare_directories(local_dir, remote_system, remote_dir):
-    """Compare local and remote directories"""
-    local_items = set(os.listdir(local_dir))
-    remote_items = set(remote_system.list_remote_dir(remote_dir))
-
-    only_local = local_items - remote_items
-    only_remote = remote_items - local_items
-    common = local_items & remote_items
-
-    print(f"\n[{remote_system.hostname}] Directory comparison:")
-    print('=' * 80)
-
-    if only_local:
-        print(f"\nOnly in local directory:")
-        for item in sorted(only_local):
-            print(f"  - {item}")
-
-    if only_remote:
-        print(f"\nOnly in remote directory:")
-        for item in sorted(only_remote):
-            print(f"  - {item}")
-
-    if common:
-        print(f"\nCommon items: {len(common)}")
-        print("(Use file comparison for detailed diff of individual files)")
-
-    print('=' * 80)
-
-
-def execute_commands_from_file(command_file, remote_systems, user, password, max_workers):
-    """Execute commands from file on remote systems"""
+        left = Path(local).read_bytes()
+    except OSError as exc:
+        return [f"Cannot read local file {local}: {exc}"], False
+    right = remote_system.read_bytes(remote)
+    if right is None:
+        return [f"Cannot read remote file {remote}"], False
+    name = label or local
+    if left == right:
+        return [f"Identical: {name}"], True
+    # A NUL byte or failed UTF-8 decoding indicates binary content. Report the
+    # difference without producing a corrupted textual diff.
+    if b"\0" in left or b"\0" in right:
+        return [f"Binary files differ: {name}"], True
     try:
-        with open(command_file, 'r') as f:
-            commands = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    except Exception as e:
-        logger.error(f"Failed to read command file: {str(e)}")
-        print(f"\nERROR: Failed to read command file '{command_file}': {str(e)}")
-        return
-
-    logger.info(f"Loaded {len(commands)} commands from {command_file}")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-
-        for hostname, ip in remote_systems:
-            future = executor.submit(
-                execute_commands_on_system,
-                hostname, ip, commands, user, password
-            )
-            futures[future] = hostname
-
-        for future in as_completed(futures):
-            hostname = futures[future]
-            try:
-                output = future.result()
-                if output:
-                    with OUTPUT_LOCK:
-                        print(output)
-            except Exception as e:
-                logger.error(f"Error processing {hostname}: {str(e)}")
-                with OUTPUT_LOCK:
-                    print(format_system_output(hostname, 'unknown', [{
-                        'command': 'process system',
-                        'status': 'FAILED',
-                        'stdout': '',
-                        'stderr': str(e)
-                    }]))
+        left_text, right_text = left.decode("utf-8"), right.decode("utf-8")
+    except UnicodeDecodeError:
+        return [f"Binary files differ: {name}"], True
+    diff = difflib.unified_diff(
+        left_text.splitlines(keepends=True), right_text.splitlines(keepends=True),
+        fromfile=f"local: {local}", tofile=f"remote: {remote}", lineterm="\n")
+    return [f"Differences found: {name}", "".join(diff).rstrip()], True
 
 
-def format_system_output(hostname, ip, entries):
-    """Create a readable output block for one remote system."""
-    lines = [
-        '',
-        OUTPUT_SEPARATOR,
-        f'HOST: {hostname} ({ip})',
-        OUTPUT_SEPARATOR,
-    ]
+def compare_directories(local, remote_system, remote):
+    try:
+        left, right = local_manifest(local), remote_system.manifest(remote)
+    except Exception as exc:
+        return [f"Directory comparison failed: {exc}"], False
+    # Set differences find entries present on only one side; the intersection
+    # contains entries that must be compared in detail.
+    lp, rp = set(left), set(right)
+    lines, unchanged, success = ["Directory comparison:"], 0, True
+    lines += [f"Only local:  {p} ({left[p]})" for p in sorted(lp - rp)]
+    lines += [f"Only remote: {p} ({right[p]})" for p in sorted(rp - lp)]
+    for rel in sorted(lp & rp):
+        if left[rel] != right[rel]:
+            lines.append(f"Type differs: {rel} (local={left[rel]}, remote={right[rel]})")
+        elif left[rel] == "file":
+            # Directories and symlinks are already described by the manifest;
+            # only regular files require a byte-by-byte comparison.
+            detail, ok = compare_file(os.path.join(local, *rel.split("/")),
+                                      remote_system, posixpath.join(remote, rel), rel)
+            success &= ok
+            if detail[0].startswith("Identical:"):
+                unchanged += 1
+            else:
+                lines += [""] + detail
+    if len(lines) == 1:
+        lines.append("Directories are identical")
+    elif unchanged:
+        lines.append(f"\nIdentical common files: {unchanged}")
+    return lines, success
 
-    for entry in entries:
-        lines.extend(['', f'$ {entry["command"]}', f'status: {entry["status"]}'])
 
-        stdout = entry.get('stdout', '').rstrip()
-        stderr = entry.get('stderr', '').rstrip()
-
-        if stdout:
-            lines.extend(['--- stdout ---', stdout])
-        if stderr:
-            lines.extend(['--- stderr ---', stderr])
-        if not stdout and not stderr:
-            lines.append('(no output)')
-
-    lines.append(OUTPUT_SEPARATOR)
-    return '\n'.join(lines)
+def host_block(host, ip, lines):
+    return "\n".join(["", SEP, f"HOST: {host} ({ip})", SEP, *lines, SEP])
 
 
-def execute_commands_on_system(hostname, ip, commands, user, password):
-    """Execute list of commands on a single system"""
-    remote = RemoteSystem(hostname, ip, user, password)
-    entries = []
+def compare_paths(local, remote_system, remote):
+    local_kind = "directory" if os.path.isdir(local) else "file" if os.path.isfile(local) else None
+    remote_kind = remote_system.kind(remote)
+    if not local_kind or not remote_kind:
+        missing = "local" if not local_kind else "remote"
+        return host_block(remote_system.hostname, remote_system.ip,
+                          [f"{missing.title()} path missing or inaccessible"]), False
+    if local_kind != remote_kind:
+        return host_block(remote_system.hostname, remote_system.ip,
+                          [f"Type mismatch: local={local_kind}, remote={remote_kind}"]), True
+    if local_kind == "directory":
+        lines, ok = compare_directories(local, remote_system, remote)
+    else:
+        lines, ok = compare_file(local, remote_system, remote)
+    return host_block(remote_system.hostname, remote_system.ip, lines), ok
 
+
+def format_commands(remote, entries):
+    lines = []
+    for item in entries:
+        lines += ["", f'$ {item["command"]}', f'status: {item["status"]}']
+        if item.get("stdout"):
+            lines += ["--- stdout ---", item["stdout"].rstrip()]
+        if item.get("stderr"):
+            lines += ["--- stderr ---", item["stderr"].rstrip()]
+        if not item.get("stdout") and not item.get("stderr"):
+            lines.append("(no output)")
+    return host_block(remote.hostname, remote.ip, lines)
+
+
+def parse_copy(command):
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError as exc:
+        if command.lstrip().upper().startswith("COPY"):
+            raise ValueError(f"invalid COPY quoting: {exc}") from exc
+        return None
+    if not parts or parts[0].upper() != "COPY":
+        return None
+    if len(parts) != 3:
+        raise ValueError("expected COPY <local_path> <remote_path>")
+    return parts[1:]
+
+
+def run_commands(remote, commands, allow_dangerous=False):
+    entries, success = [], True
     if not remote.connect():
-        return format_system_output(hostname, ip, [{
-            'command': 'connect',
-            'status': 'FAILED',
-            'stdout': '',
-            'stderr': 'Unable to establish SSH connection'
-        }])
-
+        return format_commands(remote, [{"command": "connect", "status": "FAILED",
+                                         "stderr": "Unable to establish SSH connection"}]), False
     try:
-        for cmd in commands:
-            # Check for COPY command
-            if cmd.startswith('COPY '):
-                parts = cmd.split()
-                if len(parts) == 3:
-                    local_path = parts[1]
-                    remote_path = parts[2]
-                    copied = remote.copy_to_remote(local_path, remote_path)
-                    entries.append({
-                        'command': cmd,
-                        'status': 'OK' if copied else 'FAILED',
-                        'stdout': f'Copied {local_path} to {remote_path}' if copied else '',
-                        'stderr': '' if copied else 'Copy failed; see remote_oper.log for details'
-                    })
-                else:
-                    logger.error(f"[{hostname}] Invalid COPY syntax: {cmd}")
-                    entries.append({
-                        'command': cmd,
-                        'status': 'FAILED',
-                        'stdout': '',
-                        'stderr': 'Invalid COPY syntax. Expected: COPY <local_path> <remote_path>'
-                    })
+        for command in commands:
+            try:
+                operands = parse_copy(command)
+            except ValueError as exc:
+                entries.append({"command": command, "status": "FAILED", "stderr": str(exc)})
+                success = False
                 continue
-
-            # Check for dangerous commands
-            if is_dangerous_command(cmd):
-                logger.warning(f"[{hostname}] SKIPPING DANGEROUS COMMAND: {cmd}")
-                entries.append({
-                    'command': cmd,
-                    'status': 'SKIPPED',
-                    'stdout': '',
-                    'stderr': 'Dangerous command skipped'
-                })
-                continue
-
-            return_code, stdout, stderr = remote.execute_command(cmd)
-            entries.append({
-                'command': cmd,
-                'status': f'EXIT {return_code}',
-                'stdout': stdout,
-                'stderr': stderr
-            })
-
+            if operands:
+                # COPY is a local pseudo-command: it transfers data through SFTP
+                # and is never forwarded to the remote shell.
+                ok = remote.copy(*operands)
+                entries.append({"command": command, "status": "OK" if ok else "FAILED",
+                                "stdout": "Copy completed" if ok else "",
+                                "stderr": "" if ok else "See remote_oper.log"})
+            elif not allow_dangerous and is_dangerous_command(command):
+                ok = False
+                entries.append({"command": command, "status": "SKIPPED",
+                                "stderr": "Potentially destructive; use --allow-dangerous"})
+            else:
+                code, stdout, stderr = remote.execute(command)
+                ok = code == 0
+                entries.append({"command": command, "status": f"EXIT {code}",
+                                "stdout": stdout, "stderr": stderr})
+            success &= ok
     finally:
         remote.disconnect()
-
-    return format_system_output(hostname, ip, entries)
-
-
-def process_diff(remote_system, local_path, remote_path):
-    """Process diff for a single remote system"""
-    if remote_system.connect():
-        try:
-            compare_files(local_path, remote_system, remote_path)
-        finally:
-            remote_system.disconnect()
+    return format_commands(remote, entries), success
 
 
-def load_remote_systems(file_path):
-    """Load remote systems from a file"""
-    systems = []
-
-    if not os.path.exists(file_path):
-        logger.error(f"Remote systems file not found: {file_path}")
-        print(f"\nERROR: File '{file_path}' does not exist!")
-        print("\nPlease create the file with the following format:")
-        print("  hostname1,ip_address1")
-        print("  hostname2,ip_address2")
-        print("\nExample:")
-        print("  server1,192.168.1.10")
-        print("  server2,192.168.1.20")
-        sys.exit(1)
-
+def connected_diff(remote, local, remote_path):
+    if not remote.connect():
+        return format_commands(remote, [{"command": "connect", "status": "FAILED",
+                                         "stderr": "Unable to establish SSH connection"}]), False
     try:
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
+        return compare_paths(local, remote, remote_path)
+    finally:
+        # Always close the connection, even if comparison raises an exception.
+        remote.disconnect()
 
-                if line != "" and not line.startswith('#'):
-                    parts = line.split(',')
 
-                    if len(parts) == 2:
-                        hostname, ip = parts
-                        systems.append((hostname.strip(), ip.strip()))
-                    else:
-                        logger.warning(f"Invalid line format: {line}")
+def run_parallel(remotes, worker, max_workers):
+    success = True
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        # Keep the future-to-host mapping so unhandled worker exceptions can
+        # still be attributed to the correct remote system.
+        futures = {pool.submit(worker, remote): remote for remote in remotes}
+        for future in as_completed(futures):
+            remote = futures[future]
+            try:
+                output, ok = future.result()
+            except Exception as exc:
+                logger.exception("Unhandled error for %s", remote.hostname)
+                output, ok = host_block(remote.hostname, remote.ip, [f"FAILED: {exc}"]), False
+            with OUTPUT_LOCK:
+                # Print each block while holding the lock so concurrent output
+                # cannot become interleaved line by line.
+                print(output)
+            # A failure on any host is enough to produce final exit code 1.
+            success &= ok
+    return success
 
-        if not systems:
-            logger.error(f"No valid systems found in {file_path}")
-            print(f"\nERROR: No valid systems found in '{file_path}'")
-            sys.exit(1)
 
-        logger.info(f"Loaded {len(systems)} remote systems")
-    except Exception as e:
-        logger.error(f"Failed to load remote systems file: {str(e)}")
-        sys.exit(1)
-
+def load_systems(path):
+    systems = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for number, raw in enumerate(handle, 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) == 2 and all(parts):
+                    systems.append(tuple(parts))
+                else:
+                    logger.warning("Invalid line %s in %s", number, path)
+    except OSError as exc:
+        raise ValueError(f"cannot read systems file '{path}': {exc}") from exc
+    if not systems:
+        raise ValueError(f"no valid systems found in '{path}'")
     return systems
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Linux remote operations (Python module used: Fabric)', add_help=False)
-    parser.add_argument('--diff', action='store_true', help='Compare local and remote files/directories')
-    parser.add_argument('-L', '--local', type=str, help='Local file or directory path')
-    parser.add_argument('-R', '--remote', type=str, help='Remote file or directory path')
-    parser.add_argument('--user', type=str, required=True, help='SSH username (REQUIRED)')
-    parser.add_argument('--exec', type=str, dest='exec_file', help='Execute commands from file')
-    parser.add_argument('--systems', type=str, default='/tmp/remoteSystems.in', help='Path to remote systems file')
-    parser.add_argument('--parallel', type=int, default=5, help='Number of parallel connections')
-    parser.add_argument('-h', '--help', action='store_true', help='Show help message')
-    args = parser.parse_args()
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Execute commands or recursively compare paths on remote Linux systems",
+        epilog="Command files are trusted input; the destructive-command guard is best-effort only.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--diff", action="store_true")
+    mode.add_argument("--exec", dest="exec_file", metavar="FILE")
+    parser.add_argument("-L", "--local")
+    parser.add_argument("-R", "--remote")
+    parser.add_argument("--user", required=True)
+    parser.add_argument("--systems", default="/tmp/remoteSystems.in")
+    parser.add_argument("--parallel", type=positive_int, default=5)
+    parser.add_argument("--key", help="SSH private key (no password prompt)")
+    parser.add_argument("--no-password", action="store_true", help="use SSH agent/config")
+    parser.add_argument("--connect-timeout", type=positive_int, default=10)
+    parser.add_argument("--command-timeout", type=positive_int)
+    parser.add_argument("--allow-dangerous", action="store_true")
+    return parser
 
-    if args.help:
-        print_usage()
 
-    # Load remote systems
-    remote_systems_list = load_remote_systems(args.systems)
-
-    # Prompt for password
-    password = getpass.getpass(f"Enter SSH password for user '{args.user}': ")
-
-    # Diff mode
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.diff and (not args.local or not args.remote):
+        parser.error("--diff requires --local and --remote")
+    if args.key and args.no_password:
+        parser.error("--key and --no-password are mutually exclusive")
+    try:
+        systems = load_systems(args.systems)
+    except ValueError as exc:
+        parser.error(str(exc))
+    password = None if args.key or args.no_password else getpass.getpass(
+        f"Enter SSH password for user '{args.user}': ")
+    remotes = [RemoteSystem(host, ip, args.user, password, args.key,
+                            args.connect_timeout, args.command_timeout)
+               for host, ip in systems]
     if args.diff:
-        if not args.local or not args.remote:
-            logger.error("Both -L and -R options are required with --diff")
-            sys.exit(1)
-
-        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-            futures = {}
-
-            for hostname, ip in remote_systems_list:
-                remote = RemoteSystem(hostname, ip, args.user, password)
-                future = executor.submit(process_diff, remote, args.local, args.remote)
-                futures[future] = hostname
-
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Error: {str(e)}")
-
-    # Execute commands mode
-    elif args.exec_file:
-        execute_commands_from_file(
-            args.exec_file,
-            remote_systems_list,
-            args.user,
-            password,
-            args.parallel
-        )
-
+        # run_parallel expects a single-argument worker; the lambda binds the CLI
+        # options shared by all remote systems to that worker.
+        worker = lambda remote: connected_diff(remote, args.local, args.remote)
     else:
-        print("No operation specified. Use --help for usage information.")
-        sys.exit(1)
+        try:
+            with open(args.exec_file, encoding="utf-8") as handle:
+                commands = [x.strip() for x in handle if x.strip() and not x.lstrip().startswith("#")]
+        except OSError as exc:
+            parser.error(f"cannot read command file '{args.exec_file}': {exc}")
+        worker = lambda remote: run_commands(remote, commands, args.allow_dangerous)
+    return 0 if run_parallel(remotes, worker, args.parallel) else 1
 
 
-if __name__ == '__main__':
-    # Dangerous commands to avoid
-    DANGEROUS_COMMANDS = ['rm -rf /', 'rm -rf /*', 'shutdown', 'reboot', 'init 0', 'init 6', 'halt', 'poweroff', 'mkfs', 'dd if=', ':(){:|:&};:', 'mv / ', 'chmod -R 777 /']
-    
-    # Configure logging
-    file_handler = logging.FileHandler('remote_oper.log')
-    file_handler.setLevel(logging.INFO)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s: %(message)s',
-        handlers=[file_handler]
-    )
-    logger = logging.getLogger(__name__)
-    
-    main()
+if __name__ == "__main__":
+    configure_logging()
+    sys.exit(main())
