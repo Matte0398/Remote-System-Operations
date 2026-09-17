@@ -4,8 +4,8 @@ Utilities for performing operations across multiple remote Linux or Windows syst
 
 | Script | Target systems | Operations | Connection |
 | --- | --- | --- | --- |
-| [Lnx_remote_oper.py](Lnx_remote_oper.py) | Linux | Execute commands, upload files and directories, compare local and remote paths | SSH and SFTP through Fabric |
-| [WS_remote_oper.ps1](WS_remote_oper.ps1) | Windows | Copy files and directories to the same path on remote systems | SMB through the `C$` administrative share |
+| `Lnx_remote_oper.py` | Linux | Execute commands, upload files and directories, compare local and remote paths | SSH and SFTP through Fabric |
+| `WS_remote_oper.ps1` | Windows | Copy files and directories to the same path on remote systems | SMB through the `C$` administrative share |
 
 Run the examples from this directory. Create the input files described below before running either script; they are not included in the project.
 
