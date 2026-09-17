@@ -1,455 +1,513 @@
 #############################################################################################################
-## Description: Script to copy or update specific files/directories from the local machine to multiple
-##              remote Windows machines using PowerShell Remoting (WinRM)
-##
+## Description: Copy or update selected files from the local machine to multiple remote Windows machines.
 ## Author: Matteo Z.
 #############################################################################################################
 
-function print_usage {
-    Write-Host -ForegroundColor "red" "`nDescription:"
-    Write-Host "`n   Script that copies or updates files/directories from the local Windows machine to multiple remote Windows systems using WinRM."
-    Write-Host "`n   File with the list of Windows systems: $system_list"
-    Write-Host "`n   File with all objects that should be copied/updated on the remote systems: $object_to_update"
-    Write-Host "`n   Log file: $log"
-    Write-Host "`n   The format of $system_list must be: <hostname>,<ip_address>"
-    Write-Host "`n   Example:"
-    Write-Host "      server01,192.168.1.10"
-    Write-Host "      server02,192.168.1.11"
-    Write-Host "`n   The format of $object_to_update must be:`n"
-    Write-Host "      file:C:\temp\test.txt                  - copy/update a specific file"
-    Write-Host "      file:C:\temp\test*                     - copy/update all files that begin with 'test'"
-    Write-Host "      file:C:\temp\*                         - copy/update all files in a specific directory"
-    Write-Host "      file:C:\temp\*txt:test.txt,prova.txt   - copy/update all files ending with 'txt', excluding test.txt and prova.txt"
-    Write-Host "      dir:C:\temp\test                       - copy/update a specific directory recursively"
-    Write-Host "      dir:C:\temp\test*                      - copy/update all directories that begin with 'test' recursively"
-    Write-Host "      dir:C:\temp\*:old,backup               - copy/update all directories, excluding objects named old and backup"
-    Write-Host "      C:\temp\test.txt                       - same as file:C:\temp\test.txt"
-    Write-Host "      #file:C:\temp\skip.txt                 - skip a row"
-    Write-Host -ForegroundColor "red" "`nUsage:"
-    Write-Host "`n  $script`n"
+[CmdletBinding()]
+param(
+    [string] $PathOper = "C:\temp",
+    [string] $SystemList,
+    [string] $ObjectList,
+    [string] $LogPath
+)
+
+$script:ScriptName = $MyInvocation.MyCommand.Name
+$script:LogHealthy = $true
+
+# These values are resolved here instead of directly in param(), because their defaults
+# depend on another parameter ($PathOper) and the log name also contains a timestamp.
+if ([string]::IsNullOrWhiteSpace($SystemList)) {
+    $SystemList = Join-Path $PathOper "system.txt"
+}
+if ([string]::IsNullOrWhiteSpace($ObjectList)) {
+    $ObjectList = Join-Path $PathOper "object.txt"
+}
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $LogPath = Join-Path $PathOper ("log-{0}.log" -f (Get-Date -Format "yyyy-MM-dd_HH-mm-ss"))
 }
 
-
-function write_log {
-    param (
-        [string] $message
-    )
-
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "[$timestamp] $message" | Out-File -FilePath $log -Append
+function Show-Usage {
+    Write-Host -ForegroundColor Red "`nDescription:"
+    Write-Host "   Executes copy/update operations between Windows systems."
+    Write-Host "`n   Windows systems: $SystemList"
+    Write-Host "   Objects to copy: $ObjectList"
+    Write-Host "   Log file: $LogPath"
+    Write-Host "`n   System format: <hostname>,<ip address>"
+    Write-Host "`n   Object formats:"
+    Write-Host "    file:C:\temp\test.txt                 - copy/update one file"
+    Write-Host "    file:C:\temp\test*                    - copy/update matching files"
+    Write-Host "    file:C:\temp\*txt:test.txt,prova.txt  - exclude the listed names"
+    Write-Host "    dir:C:\temp\test                      - copy a directory recursively"
+    Write-Host "    dir:C:\temp\*:old,backup              - exclude these names recursively"
+    Write-Host "    C:\temp\test.txt                      - same as file:C:\temp\test.txt"
+    Write-Host "    #file:C:\temp\skip.txt                - comment/skip a row"
+    Write-Host -ForegroundColor Red "`nUsage:"
+    Write-Host "   $script:ScriptName [-PathOper <path>] [-SystemList <file>] [-ObjectList <file>] [-LogPath <file>]`n"
 }
 
+function Write-Log {
+    param([Parameter(Mandatory)][string] $Message)
 
-function write_status {
-    param (
-        [string] $message,
-        [string] $color = "white"
-    )
-
-    Write-Host -ForegroundColor $color $message
-    write_log $message
+    try {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Add-Content -LiteralPath $LogPath -Value "[$timestamp] $Message" -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        $script:LogHealthy = $false
+        Write-Warning "Unable to write to log '$LogPath': $($_.Exception.Message)"
+    }
 }
 
-
-function split_object_spec {
-    param (
-        [string] $line
+function Write-Status {
+    param(
+        [Parameter(Mandatory)][string] $Message,
+        [ConsoleColor] $Color = [ConsoleColor]::White
     )
+    Write-Host -ForegroundColor $Color $Message
+    Write-Log $Message
+}
 
-    $clean_line = $line.Trim()
-    $exclusions = @()
+function New-CopyResult {
+    param([int] $Copied = 0, [int] $Skipped = 0, [int] $Failed = 0)
+    [PSCustomObject]@{ Copied = $Copied; Skipped = $Skipped; Failed = $Failed }
+}
+
+function Split-ObjectSpecification {
+    param([Parameter(Mandatory)][string] $Line)
+
+    $cleanLine = $Line.Trim()
     $mode = "file"
+    $exclusions = @()
 
-    if ($clean_line -match '^(?i)(file|dir):(.+)$') {
+    if ($cleanLine -match '^(?i)(file|dir):(.+)$') {
         $mode = $matches[1].ToLowerInvariant()
-        $clean_line = $matches[2].Trim()
+        $cleanLine = $matches[2].Trim()
     }
 
-    # Skip the drive separator, for example C:, and use the next ':' as exclusion separator.
-    $separator_index = $clean_line.IndexOf(':', 2)
-
-    if ($separator_index -ge 0) {
-        $pattern = $clean_line.Substring(0, $separator_index).Trim()
-        $exclusion_text = $clean_line.Substring($separator_index + 1).Trim()
-
-        if (-not [string]::IsNullOrWhiteSpace($exclusion_text)) {
-            $exclusions = @(
-                $exclusion_text -split ',' |
-                ForEach-Object { $_.Trim() } |
-                Where-Object { $_ -ne "" }
-            )
+    # The first colon belongs to the drive letter (C:). Any following colon separates
+    # the source pattern from the optional comma-separated exclusion list.
+    # Example: C:\temp\*txt:test.txt,prova.txt
+    $separatorIndex = $cleanLine.IndexOf(':', 2)
+    if ($separatorIndex -ge 0) {
+        $pattern = $cleanLine.Substring(0, $separatorIndex).Trim()
+        $exclusionText = $cleanLine.Substring($separatorIndex + 1).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($exclusionText)) {
+            $exclusions = @($exclusionText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         }
     } else {
-        $pattern = $clean_line
+        $pattern = $cleanLine
     }
 
-    return [PSCustomObject]@{
-        Mode = $mode
-        Pattern = $pattern
-        Exclusions = $exclusions
-    }
+    [PSCustomObject]@{ Mode = $mode; Pattern = $pattern; Exclusions = [string[]]$exclusions }
 }
 
-
-function get_items_from_pattern {
-    param(
-        [string] $localPattern,
-        [ValidateSet("file", "dir")]
-        [string] $mode
-    )
-
-    if ([string]::IsNullOrWhiteSpace($localPattern)) {
-        return @()
-    }
-
-    if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($localPattern)) {
-        $parent_path = Split-Path -Path $localPattern -Parent
-        $leaf_filter = Split-Path -Path $localPattern -Leaf
-
-        if ([string]::IsNullOrWhiteSpace($parent_path)) {
-            $parent_path = "."
-        }
-
-        if (-not (Test-Path -LiteralPath $parent_path -PathType Container)) {
-            write_status "Warning!! Source directory not found: $parent_path" "yellow"
-            return @()
-        }
-
-        if ($mode -eq "dir") {
-            return @(Get-ChildItem -LiteralPath $parent_path -Filter $leaf_filter -Directory -ErrorAction SilentlyContinue)
-        }
-
-        return @(Get-ChildItem -LiteralPath $parent_path -Filter $leaf_filter -File -ErrorAction SilentlyContinue)
-    }
-
-    if ($mode -eq "dir" -and (Test-Path -LiteralPath $localPattern -PathType Container)) {
-        return @(Get-Item -LiteralPath $localPattern)
-    }
-
-    if ($mode -eq "file" -and (Test-Path -LiteralPath $localPattern -PathType Leaf)) {
-        return @(Get-Item -LiteralPath $localPattern)
-    }
-
-    write_status "Warning!! Source $mode not found: $localPattern" "yellow"
-    return @()
-}
-
-
-function get_remote_destination_path {
-    param(
-        [System.IO.FileSystemInfo] $item
-    )
-
-    if ($item.FullName -notmatch '^[A-Za-z]:\\') {
-        write_status "Warning!! Unsupported source path format: $($item.FullName)" "yellow"
+function Get-ObjectSpecifications {
+    try {
+        $lines = @(Get-Content -LiteralPath $ObjectList -ErrorAction Stop)
+    } catch {
+        Write-Status "Unable to read object list '$ObjectList': $($_.Exception.Message)" Red
         return $null
     }
 
-    # With WinRM/Copy-Item -ToSession we can use the same absolute path on the remote system,
-    # for example C:\temp\file.txt -> C:\temp\file.txt on the remote server.
-    return $item.FullName
-}
+    $specifications = @()
+    foreach ($line in $lines) {
+        $cleanLine = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($cleanLine) -or $cleanLine.StartsWith('#')) { continue }
 
-
-function test_excluded_item {
-    param(
-        [System.IO.FileSystemInfo] $item,
-        [string[]] $exclusions
-    )
-
-    return ($exclusions -contains $item.Name)
-}
-
-
-function test_excluded_relative_path {
-    param(
-        [string] $relativePath,
-        [string[]] $exclusions
-    )
-
-    if ($exclusions.Length -eq 0) {
-        return $false
-    }
-
-    $path_parts = @($relativePath -split '[\\/]') | Where-Object { $_ -ne "" }
-
-    foreach ($part in $path_parts) {
-        if ($exclusions -contains $part) {
-            return $true
+        $specification = Split-ObjectSpecification $cleanLine
+        if ([string]::IsNullOrWhiteSpace($specification.Pattern)) {
+            Write-Status "Invalid empty object specification: '$line'" Red
+            continue
         }
+        $specifications += $specification
     }
 
-    return $false
-}
-
-
-function ensure_remote_directory {
-    param(
-        [System.Management.Automation.Runspaces.PSSession] $session,
-        [string] $path
-    )
-
-    Invoke-Command -Session $session -ScriptBlock {
-        param($remotePath)
-
-        if (-not (Test-Path -LiteralPath $remotePath -PathType Container)) {
-            New-Item -Path $remotePath -ItemType Directory -Force | Out-Null
-        }
-    } -ArgumentList $path -ErrorAction Stop
-}
-
-
-function copy_file_to_remote {
-    param(
-        [System.Management.Automation.Runspaces.PSSession] $session,
-        [System.IO.FileInfo] $file
-    )
-
-    $destination = get_remote_destination_path -item $file
-
-    if ([string]::IsNullOrWhiteSpace($destination)) {
-        return
+    if ($specifications.Count -eq 0) {
+        Write-Status "No valid objects were found in '$ObjectList'." Red
+        return $null
     }
+    return ,$specifications
+}
 
-    $destinationDir = Split-Path -Path $destination -Parent
+function Get-SourceItems {
+    param(
+        [Parameter(Mandatory)][string] $LocalPattern,
+        [Parameter(Mandatory)][ValidateSet("file", "dir")][string] $Mode
+    )
 
+    $items = @()
+    $hadErrors = $false
     try {
-        ensure_remote_directory -session $session -path $destinationDir
-        Copy-Item -LiteralPath $file.FullName -Destination $destination -ToSession $session -Force -ErrorAction Stop
-        write_status "Copied file: $($file.FullName) to $destination" "green"
+        # -LiteralPath protects the parent directory from wildcard expansion, while
+        # -Filter applies wildcards only to the final path component. Consequently,
+        # wildcard characters in intermediate directories are intentionally unsupported.
+        if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($LocalPattern)) {
+            $parentPath = Split-Path -Path $LocalPattern -Parent
+            $leafFilter = Split-Path -Path $LocalPattern -Leaf
+            if ([string]::IsNullOrWhiteSpace($parentPath)) { $parentPath = "." }
+            if (-not (Test-Path -LiteralPath $parentPath -PathType Container)) {
+                Write-Status "Source directory not found: $parentPath" Yellow
+                return [PSCustomObject]@{ Items = @(); HadErrors = $true }
+            }
+            if ($Mode -eq "dir") {
+                $items = @(Get-ChildItem -LiteralPath $parentPath -Filter $leafFilter -Directory -ErrorAction Stop)
+            } else {
+                $items = @(Get-ChildItem -LiteralPath $parentPath -Filter $leafFilter -File -ErrorAction Stop)
+            }
+        } elseif ($Mode -eq "dir" -and (Test-Path -LiteralPath $LocalPattern -PathType Container)) {
+            $items = @(Get-Item -LiteralPath $LocalPattern -ErrorAction Stop)
+        } elseif ($Mode -eq "file" -and (Test-Path -LiteralPath $LocalPattern -PathType Leaf)) {
+            $items = @(Get-Item -LiteralPath $LocalPattern -ErrorAction Stop)
+        } else {
+            Write-Status "Source $Mode not found: $LocalPattern" Yellow
+            $hadErrors = $true
+        }
     } catch {
-        write_status "Failed to copy file '$($file.FullName)' to '$destination': $_" "red"
+        Write-Status "Unable to resolve source '$LocalPattern': $($_.Exception.Message)" Red
+        $hadErrors = $true
+    }
+    [PSCustomObject]@{ Items = $items; HadErrors = $hadErrors }
+}
+
+function Get-RemoteDestinationPath {
+    param(
+        [Parameter(Mandatory)][string] $DriveName,
+        [Parameter(Mandatory)][System.IO.FileSystemInfo] $Item
+    )
+
+    if ($Item.FullName -notmatch '^[A-Za-z]:\\') {
+        Write-Status "Unsupported source path format: $($Item.FullName)" Yellow
+        return $null
+    }
+    $driveLetter = $Item.FullName.Substring(0, 1).ToUpperInvariant()
+    if ($driveLetter -ne "C") {
+        Write-Status "The remote share is C$. Source '$($Item.FullName)' on drive $driveLetter`: was ignored." Yellow
+        return $null
+    }
+
+    # The mapped PSDrive points to the remote C$ share. Removing "C:\" from the local
+    # path and appending the remainder preserves the same absolute path remotely:
+    # C:\temp\a.txt -> WSRxxxxxx:\temp\a.txt -> \\host\C$\temp\a.txt.
+    Join-Path "$DriveName`:\" $Item.FullName.Substring(3)
+}
+
+function Test-ExcludedName {
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [AllowEmptyCollection()][string[]] $Exclusions = @()
+    )
+    return ($Exclusions -contains $Name)
+}
+
+function Copy-FileToRemote {
+    param(
+        [Parameter(Mandatory)][string] $DriveName,
+        [Parameter(Mandatory)][System.IO.FileInfo] $File
+    )
+
+    $destination = Get-RemoteDestinationPath $DriveName $File
+    if ([string]::IsNullOrWhiteSpace($destination)) { return New-CopyResult -Skipped 1 }
+
+    try {
+        $destinationDirectory = Split-Path $destination -Parent
+        if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+            New-Item -Path $destinationDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Write-Log "Created directory: $destinationDirectory"
+        }
+        Copy-Item -LiteralPath $File.FullName -Destination $destination -Force -ErrorAction Stop
+        Write-Status "Copied file: $($File.FullName) to $destination" Green
+        return New-CopyResult -Copied 1
+    } catch {
+        Write-Status "Failed to copy file '$($File.FullName)' to '$destination': $($_.Exception.Message)" Red
+        return New-CopyResult -Failed 1
     }
 }
 
-
-function copy_directory_to_remote {
+function Copy-DirectoryToRemote {
     param(
-        [System.Management.Automation.Runspaces.PSSession] $session,
-        [System.IO.DirectoryInfo] $directory,
-        [string[]] $exclusions
+        [Parameter(Mandatory)][string] $DriveName,
+        [Parameter(Mandatory)][System.IO.DirectoryInfo] $Directory,
+        [AllowEmptyCollection()][string[]] $Exclusions = @()
     )
 
-    $destination = get_remote_destination_path -item $directory
-
-    if ([string]::IsNullOrWhiteSpace($destination)) {
-        return
-    }
+    $result = New-CopyResult
+    $destination = Get-RemoteDestinationPath $DriveName $Directory
+    if ([string]::IsNullOrWhiteSpace($destination)) { return New-CopyResult -Skipped 1 }
 
     try {
-        ensure_remote_directory -session $session -path $destination
+        if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+            New-Item -Path $destination -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Write-Log "Created directory: $destination"
+        }
+    } catch {
+        Write-Status "Failed to create destination directory '$destination': $($_.Exception.Message)" Red
+        return New-CopyResult -Failed 1
+    }
 
-        $children = @(Get-ChildItem -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue)
+    # Walk the tree explicitly instead of using Get-ChildItem -Recurse. This allows an
+    # excluded directory to be pruned before it is enumerated, avoiding unnecessary I/O
+    # and access errors in content that the user does not want to copy.
+    $pendingDirectories = New-Object 'System.Collections.Generic.Queue[System.IO.DirectoryInfo]'
+    $pendingDirectories.Enqueue($Directory)
+
+    while ($pendingDirectories.Count -gt 0) {
+        $currentDirectory = $pendingDirectories.Dequeue()
+        try {
+            $children = @(Get-ChildItem -LiteralPath $currentDirectory.FullName -Force -ErrorAction Stop)
+        } catch {
+            $result.Failed++
+            Write-Status "Failed to enumerate '$($currentDirectory.FullName)': $($_.Exception.Message)" Red
+            continue
+        }
 
         foreach ($child in $children) {
-            $relative_child_path = $child.FullName.Substring($directory.FullName.Length).TrimStart('\')
-
-            if (test_excluded_relative_path -relativePath $relative_child_path -exclusions $exclusions) {
-                write_log "Skipped by exclusion: $($child.FullName)"
+            $relativePath = $child.FullName.Substring($Directory.FullName.Length).TrimStart('\')
+            if (Test-ExcludedName $child.Name $Exclusions) {
+                $result.Skipped++
+                Write-Log "Skipped by exclusion: $($child.FullName)"
                 continue
             }
 
-            $child_destination = Join-Path -Path $destination -ChildPath $relative_child_path
-
+            $childDestination = Join-Path $destination $relativePath
             if ($child.PSIsContainer) {
-                ensure_remote_directory -session $session -path $child_destination
-            } else {
-                $child_destination_dir = Split-Path -Path $child_destination -Parent
-                ensure_remote_directory -session $session -path $child_destination_dir
-                Copy-Item -LiteralPath $child.FullName -Destination $child_destination -ToSession $session -Force -ErrorAction Stop
-                write_log "Copied file: $($child.FullName) to $child_destination"
-            }
-        }
-
-        write_status "Copied directory: $($directory.FullName) to $destination" "green"
-    } catch {
-        write_status "Failed to copy directory '$($directory.FullName)' to '$destination': $_" "red"
-    }
-}
-
-
-function copy_objects_to_remote {
-    param(
-        [System.Management.Automation.Runspaces.PSSession] $session,
-        [string] $mode,
-        [string] $localPattern,
-        [string[]] $exclusions
-    )
-
-    $items = @(get_items_from_pattern -localPattern $localPattern -mode $mode)
-
-    if ($items.Length -eq 0) {
-        write_status "Warning!! No $mode items found for pattern: $localPattern" "yellow"
-        return
-    }
-
-    foreach ($item in $items) {
-        if (test_excluded_item -item $item -exclusions $exclusions) {
-            write_log "Skipped by exclusion: $($item.FullName)"
-            continue
-        }
-
-        if ($mode -eq "dir") {
-            copy_directory_to_remote -session $session -directory $item -exclusions $exclusions
-        } else {
-            copy_file_to_remote -session $session -file $item
-        }
-    }
-}
-
-
-function open_remote_session {
-    param(
-        [string] $hostname,
-        [string] $ip,
-        [PSCredential] $credential
-    )
-
-    $remote_endpoint = $hostname
-    $session = $null
-
-    try {
-        write_status "Testing WinRM on $remote_endpoint ($ip)" "cyan"
-        Test-WSMan -ComputerName $remote_endpoint -ErrorAction Stop | Out-Null
-    } catch {
-        if (-not [string]::IsNullOrWhiteSpace($ip)) {
-            try {
-                write_status "WinRM test failed on hostname. Trying IP address $ip" "yellow"
-                Test-WSMan -ComputerName $ip -ErrorAction Stop | Out-Null
-                $remote_endpoint = $ip
-            } catch {
-                write_status "WinRM is not reachable on $hostname ($ip): $_" "red"
-                return
-            }
-        } else {
-            write_status "WinRM is not reachable on $hostname ($ip): $_" "red"
-            return
-        }
-    }
-
-    try {
-        write_status "Opening PowerShell session to $remote_endpoint ($hostname)" "cyan"
-        $session = New-PSSession -ComputerName $remote_endpoint -Credential $credential -ErrorAction Stop
-
-        foreach ($line in Get-Content $object_to_update) {
-            $clean_line = $line.Trim()
-
-            if ([string]::IsNullOrWhiteSpace($clean_line) -or $clean_line.StartsWith("#")) {
+                # Junctions and symbolic-link directories may lead outside the requested
+                # tree or create cycles. Skip them rather than following or recreating them.
+                if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $result.Skipped++
+                    Write-Status "Skipped reparse point: $($child.FullName)" Yellow
+                    continue
+                }
+                try {
+                    if (-not (Test-Path -LiteralPath $childDestination -PathType Container)) {
+                        New-Item -Path $childDestination -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                        Write-Log "Created directory: $childDestination"
+                    }
+                    $pendingDirectories.Enqueue([System.IO.DirectoryInfo]$child)
+                } catch {
+                    $result.Failed++
+                    Write-Status "Failed to create directory '$childDestination': $($_.Exception.Message)" Red
+                }
                 continue
             }
 
-            $object_spec = split_object_spec -line $clean_line
-
-            copy_objects_to_remote `
-                -session $session `
-                -mode $object_spec.Mode `
-                -localPattern $object_spec.Pattern `
-                -exclusions $object_spec.Exclusions
-        }
-    } catch {
-        write_status "Failed to process $remote_endpoint ($hostname): $_" "red"
-    } finally {
-        if ($null -ne $session) {
-            Remove-PSSession $session
-            write_status "Closed PowerShell session to $remote_endpoint" "green"
+            try {
+                $childDestinationDirectory = Split-Path $childDestination -Parent
+                if (-not (Test-Path -LiteralPath $childDestinationDirectory -PathType Container)) {
+                    New-Item -Path $childDestinationDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                }
+                Copy-Item -LiteralPath $child.FullName -Destination $childDestination -Force -ErrorAction Stop
+                $result.Copied++
+                Write-Log "Copied file: $($child.FullName) to $childDestination"
+            } catch {
+                $result.Failed++
+                Write-Status "Failed to copy '$($child.FullName)' to '$childDestination': $($_.Exception.Message)" Red
+            }
         }
     }
+
+    $color = if ($result.Failed -eq 0) { "Green" } else { "Yellow" }
+    Write-Status "Directory completed: $($Directory.FullName) (copied=$($result.Copied), skipped=$($result.Skipped), failed=$($result.Failed))" $color
+    return $result
 }
 
-
-function test_system_list_entry {
+function Copy-ObjectsToRemote {
     param(
-        [string] $clean_system
+        [Parameter(Mandatory)][string] $DriveName,
+        [Parameter(Mandatory)][ValidateSet("file", "dir")][string] $Mode,
+        [Parameter(Mandatory)][string] $LocalPattern,
+        [AllowEmptyCollection()][string[]] $Exclusions = @()
     )
 
-    $parts = $clean_system -split ','
-
-    if ($parts.Length -ne 2) {
-        return $false
+    $result = New-CopyResult
+    $sourceResult = Get-SourceItems $LocalPattern $Mode
+    if ($sourceResult.HadErrors) { $result.Failed++ }
+    if ($sourceResult.Items.Count -eq 0) {
+        Write-Status "No $Mode items found for pattern: $LocalPattern" Yellow
+        if (-not $sourceResult.HadErrors) { $result.Failed++ }
+        return $result
     }
 
-    if ([string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1])) {
-        return $false
-    }
+    foreach ($item in $sourceResult.Items) {
+        if (Test-ExcludedName $item.Name $Exclusions) {
+            $result.Skipped++
+            Write-Log "Skipped by exclusion: $($item.FullName)"
+            continue
+        }
+        if ($Mode -eq "dir") {
+            $itemResult = Copy-DirectoryToRemote $DriveName $item $Exclusions
+        } else {
+            $itemResult = Copy-FileToRemote $DriveName $item
+        }
 
-    return $true
+        # Each lower-level copy operation returns counters rather than a simple Boolean,
+        # so partial success is retained and included in the final per-host summary.
+        $result.Copied += $itemResult.Copied
+        $result.Skipped += $itemResult.Skipped
+        $result.Failed += $itemResult.Failed
+    }
+    return $result
 }
 
-
-function main {
-    if (-not (Test-Path $path_oper -PathType Container)) {
-        New-Item -Path $path_oper -ItemType Directory -Force | Out-Null
-    }
-
-    if (-not (Test-Path $system_list) -or (Get-Content $system_list).Length -eq 0) {
-        $message = "`nWarning!! The file with the list of all Windows systems '$system_list' doesn't exist or it's empty!"
-        Write-Host -ForegroundColor "yellow" $message
-        write_log $message
-        print_usage
-        return
-    }
-
-    if (-not (Test-Path $object_to_update) -or (Get-Content $object_to_update).Length -eq 0) {
-        $message = "`nWarning!! The file with all objects to be copied/updated '$object_to_update' doesn't exist or it's empty!"
-        Write-Host -ForegroundColor "yellow" $message
-        write_log $message
-        print_usage
-        return
-    }
-
-    # Validate system list before asking for credentials.
-    $valid_systems = @()
-    $invalid_found = $false
-
-    foreach ($system in Get-Content $system_list) {
-        $clean_system = $system.Trim()
-
-        if ([string]::IsNullOrWhiteSpace($clean_system) -or $clean_system.StartsWith("#")) {
-            continue
-        }
-
-        if (-not (test_system_list_entry -clean_system $clean_system)) {
-            $message = "Invalid entry in $system_list ($clean_system)"
-            Write-Host -ForegroundColor "red" $message
-            write_log $message
-            $invalid_found = $true
-            continue
-        }
-
-        $parts = $clean_system -split ','
-        $valid_systems += [PSCustomObject]@{
-            Hostname = $parts[0].Trim()
-            IP = $parts[1].Trim()
-        }
-    }
-
-    if ($invalid_found) {
-        write_status "One or more invalid entries were found in $system_list. Fix the file and run the script again." "red"
-        return
-    }
-
-    if ($valid_systems.Count -eq 0) {
-        write_status "No valid remote systems found in $system_list" "red"
-        return
-    }
-
-    foreach ($remote_system in $valid_systems) {
-        $credential = Get-Credential -Message "Type the credential to login on $($remote_system.Hostname) ($($remote_system.IP))"
-        write_status "`nProcessing remote system: $($remote_system.Hostname) ($($remote_system.IP))" "cyan"
-        open_remote_session -hostname $remote_system.Hostname -ip $remote_system.IP -credential $credential
-    }
-
-    if ((Test-Path $log -PathType Leaf) -and ((Get-Item $log).Length -gt 0)) {
-        Write-Host "The file '$log' has been created, you should check it!"
+function Test-SmbEndpoint {
+    param([Parameter(Mandatory)][string] $Endpoint)
+    try {
+        return [bool](Test-NetConnection -ComputerName $Endpoint -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop)
+    } catch {
+        Write-Status "Unable to test port 445 on '$Endpoint': $($_.Exception.Message)" Yellow
+        return $false
     }
 }
 
-########## MAIN ##########
+function Invoke-RemoteCopy {
+    param(
+        [Parameter(Mandatory)][string] $Hostname,
+        [string] $Ip,
+        [Parameter(Mandatory)][PSCredential] $Credential,
+        [Parameter(Mandatory)][object[]] $Specifications
+    )
 
-$script = $MyInvocation.MyCommand.Name
-$date = Get-Date -f yyyy-MM-dd_HH-mm-ss
-$path_oper = "C:\temp"
-$system_list = "$path_oper\system.txt"
-$object_to_update = "$path_oper\object.txt"
-$log = "$path_oper\log-$date.log"
-main
+    $result = New-CopyResult
+    $remoteEndpoint = $Hostname
+    $portOpen = Test-SmbEndpoint $remoteEndpoint
+
+    # Prefer the hostname so logs and SMB authentication use the machine identity.
+    # Fall back to the configured IP only when port 445 is unreachable by hostname.
+    if (-not $portOpen -and -not [string]::IsNullOrWhiteSpace($Ip) -and $Ip -ne $Hostname) {
+        $remoteEndpoint = $Ip
+        $portOpen = Test-SmbEndpoint $remoteEndpoint
+    }
+    if (-not $portOpen) {
+        Write-Status "Port 445 is closed or unreachable on $Hostname ($Ip)" Red
+        return New-CopyResult -Failed 1
+    }
+
+    Write-Status "Port 445 is open on $remoteEndpoint ($Hostname)" Green
+    $remoteShare = "\\$remoteEndpoint\C$"
+
+    # A unique drive name prevents collisions with existing PSDrives or concurrent runs.
+    $driveName = "WSR$([guid]::NewGuid().ToString('N').Substring(0, 6))"
+    try {
+        New-PSDrive -Name $driveName -PSProvider FileSystem -Root $remoteShare -Credential $Credential -ErrorAction Stop | Out-Null
+        Write-Status "Successfully mapped $remoteShare to $driveName`:" Green
+    } catch {
+        Write-Status "Failed to map ${remoteShare}: $($_.Exception.Message)" Red
+        return New-CopyResult -Failed 1
+    }
+
+    try {
+        foreach ($specification in $Specifications) {
+            $copyResult = Copy-ObjectsToRemote $driveName $specification.Mode $specification.Pattern $specification.Exclusions
+            $result.Copied += $copyResult.Copied
+            $result.Skipped += $copyResult.Skipped
+            $result.Failed += $copyResult.Failed
+        }
+    } catch {
+        $result.Failed++
+        Write-Status "Unexpected copy error for ${Hostname}: $($_.Exception.Message)" Red
+    } finally {
+        try {
+            if (Get-PSDrive -Name $driveName -ErrorAction SilentlyContinue) {
+                Remove-PSDrive -Name $driveName -Force -ErrorAction Stop
+                Write-Status "Disconnected $driveName`:" Green
+            }
+        } catch {
+            $result.Failed++
+            Write-Status "Failed to disconnect $driveName`: $($_.Exception.Message)" Red
+        }
+    }
+
+    $color = if ($result.Failed -eq 0) { "Green" } else { "Yellow" }
+    Write-Status "System completed: $Hostname (copied=$($result.Copied), skipped=$($result.Skipped), failed=$($result.Failed))" $color
+    return $result
+}
+
+function Invoke-Main {
+    try {
+        if (-not (Test-Path -LiteralPath $PathOper -PathType Container)) {
+            New-Item -Path $PathOper -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        $logDirectory = Split-Path $LogPath -Parent
+        if ($logDirectory -and -not (Test-Path -LiteralPath $logDirectory -PathType Container)) {
+            New-Item -Path $logDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+    } catch {
+        Write-Host -ForegroundColor Red "Unable to initialize working/log directory: $($_.Exception.Message)"
+        return 1
+    }
+
+    if (-not (Test-Path -LiteralPath $SystemList -PathType Leaf)) {
+        Write-Status "The Windows system list '$SystemList' does not exist." Yellow
+        Show-Usage
+        return 1
+    }
+    if (-not (Test-Path -LiteralPath $ObjectList -PathType Leaf)) {
+        Write-Status "The object list '$ObjectList' does not exist." Yellow
+        Show-Usage
+        return 1
+    }
+
+    # Parse the object list once. Reusing the validated specifications for every host
+    # avoids rereading the file and guarantees that all hosts receive the same operation.
+    $specifications = Get-ObjectSpecifications
+    if ($null -eq $specifications -or $specifications.Count -eq 0) { return 1 }
+
+    try {
+        $systemLines = @(Get-Content -LiteralPath $SystemList -ErrorAction Stop)
+    } catch {
+        Write-Status "Unable to read system list '$SystemList': $($_.Exception.Message)" Red
+        return 1
+    }
+
+    $systems = @()
+    $configurationErrors = 0
+    foreach ($line in $systemLines) {
+        $cleanSystem = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($cleanSystem) -or $cleanSystem.StartsWith('#')) { continue }
+        $parts = @($cleanSystem -split ',', 2)
+        $hostname = $parts[0].Trim()
+        $ip = if ($parts.Count -eq 2) { $parts[1].Trim() } else { "" }
+        if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($hostname)) {
+            $configurationErrors++
+            Write-Status "Invalid entry in '$SystemList': $cleanSystem" Red
+            continue
+        }
+        $systems += [PSCustomObject]@{ Hostname = $hostname; Ip = $ip }
+    }
+    if ($systems.Count -eq 0) {
+        Write-Status "No valid systems were found in '$SystemList'." Red
+        return 1
+    }
+
+    try {
+        $credential = Get-Credential -Message "Type the credential to log in to the remote Windows systems" -ErrorAction Stop
+    } catch {
+        Write-Status "Credential request failed or was cancelled: $($_.Exception.Message)" Red
+        return 1
+    }
+    if ($null -eq $credential) {
+        Write-Status "Credential request was cancelled." Red
+        return 1
+    }
+
+    # Invalid system-list rows count as failures even though valid rows are still processed.
+    $total = New-CopyResult -Failed $configurationErrors
+    foreach ($system in $systems) {
+        Write-Status "`nProcessing remote system: $($system.Hostname) ($($system.Ip))" Cyan
+        $systemResult = Invoke-RemoteCopy $system.Hostname $system.Ip $credential $specifications
+        $total.Copied += $systemResult.Copied
+        $total.Skipped += $systemResult.Skipped
+        $total.Failed += $systemResult.Failed
+    }
+
+    $color = if ($total.Failed -eq 0 -and $script:LogHealthy) { "Green" } else { "Yellow" }
+    Write-Status "`nOverall result: copied=$($total.Copied), skipped=$($total.Skipped), failed=$($total.Failed). Log: $LogPath" $color
+    if ($total.Failed -gt 0 -or -not $script:LogHealthy) { return 1 }
+    return 0
+}
+
+$exitCode = Invoke-Main
+
+# Dot-sourcing is useful for tests or interactive troubleshooting: return the result
+# without terminating the caller's PowerShell session. Normal execution uses an exit
+# code that schedulers and CI systems can evaluate.
+if ($MyInvocation.InvocationName -eq '.') { return $exitCode }
+exit $exitCode
